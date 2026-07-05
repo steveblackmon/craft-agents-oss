@@ -8,7 +8,7 @@
  */
 
 import type { ReactNode } from 'react'
-import { useMemo, useState, useCallback } from 'react'
+import { useMemo, useState, useCallback, useEffect, useRef } from 'react'
 import type { StoredSession } from '@craft-agent/core'
 import { cn } from '../../lib/utils'
 import { CHAT_LAYOUT, CHAT_CLASSES } from '../../lib/layout'
@@ -22,6 +22,7 @@ import {
   getAssistantTurnUiKey,
   type ActivityItem,
 } from './turn-utils'
+import { getTurnAnchorMessageId, messageAnchorDomId } from './message-anchor'
 
 export type SessionViewerMode = 'interactive' | 'readonly'
 
@@ -46,7 +47,16 @@ export interface SessionViewerProps {
   footer?: ReactNode
   /** Optional session folder path for stripping from file paths in tool display */
   sessionFolderPath?: string
+  /**
+   * Deep-link target: the messageId of a message to scroll to and briefly
+   * highlight once the transcript has rendered. Derived from a `#msg-<id>`
+   * fragment (or `/m/<id>` route segment) by the host app. See #949.
+   */
+  targetMessageId?: string
 }
+
+/** How long the transient highlight stays on a deep-linked message. */
+const MESSAGE_HIGHLIGHT_MS = 2400
 
 /**
  * CraftAgentLogo - The Craft Agent "C" logo for branding
@@ -83,6 +93,7 @@ export function SessionViewer({
   header,
   footer,
   sessionFolderPath,
+  targetMessageId,
 }: SessionViewerProps) {
   // Convert StoredMessage[] to Message[] and group into turns.
   // Viewer is always a snapshot of a finished session, so we mark it as not processing
@@ -107,6 +118,39 @@ export function SessionViewer({
 
   // Track expanded activity groups
   const [expandedActivityGroups, setExpandedActivityGroups] = useState<Set<string>>(new Set())
+
+  // Deep-link scroll-to: the scrollable transcript container and the messageId
+  // currently painted with the transient highlight. See #949.
+  const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const [highlightedMessageId, setHighlightedMessageId] = useState<string | null>(null)
+
+  // When a target message id is supplied (from a `#msg-<id>` fragment), find the
+  // corresponding wrapper and scroll it into view with a transient highlight.
+  // The effect also depends on `turns` so a target that arrives before the
+  // session has loaded is honored once the transcript renders.
+  useEffect(() => {
+    if (!targetMessageId) return
+    const container = scrollContainerRef.current
+    if (!container) return
+
+    let cleared: ReturnType<typeof setTimeout> | undefined
+    const raf = requestAnimationFrame(() => {
+      // Attribute lookup avoids escaping ids that contain CSS-significant chars.
+      const escaped = typeof CSS !== 'undefined' && CSS.escape
+        ? CSS.escape(targetMessageId)
+        : targetMessageId.replace(/"/g, '\\"')
+      const el = container.querySelector(`[data-message-id="${escaped}"]`)
+      if (!el) return
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      setHighlightedMessageId(targetMessageId)
+      cleared = setTimeout(() => setHighlightedMessageId(null), MESSAGE_HIGHLIGHT_MS)
+    })
+
+    return () => {
+      cancelAnimationFrame(raf)
+      if (cleared) clearTimeout(cleared)
+    }
+  }, [targetMessageId, turns])
 
   const handleExpandedChange = useCallback((turnId: string, expanded: boolean) => {
     setExpandedTurns(prev => {
@@ -158,12 +202,25 @@ export function SessionViewer({
             WebkitMaskImage: 'linear-gradient(to bottom, transparent 0%, black 32px, black calc(100% - 32px), transparent 100%)'
           }}
         >
-          <div className="h-full overflow-y-auto">
+          <div ref={scrollContainerRef} className="h-full overflow-y-auto">
             <div className={cn(CHAT_LAYOUT.maxWidth, "mx-auto", CHAT_LAYOUT.containerPadding, CHAT_LAYOUT.messageSpacing)}>
             {turns.map((turn, index) => {
+              // Stable per-message anchor so a `#msg-<id>` deep link can target
+              // this exact message. `scroll-mt` keeps the target clear of the
+              // top gradient-fade mask; the ring is the transient highlight.
+              const anchorMessageId = getTurnAnchorMessageId(turn, index)
+              const isHighlighted = !!anchorMessageId && anchorMessageId === highlightedMessageId
+              const anchorProps = anchorMessageId
+                ? { id: messageAnchorDomId(anchorMessageId), 'data-message-id': anchorMessageId }
+                : {}
+              const anchorClass = cn(
+                'scroll-mt-12 rounded-xl transition-shadow duration-500',
+                isHighlighted && 'ring-2 ring-[#9570BE]/60 ring-offset-2 ring-offset-transparent'
+              )
+
               if (turn.type === 'user') {
                 return (
-                  <div key={turn.message.id} className={CHAT_LAYOUT.userMessagePadding}>
+                  <div key={turn.message.id} {...anchorProps} className={cn(anchorClass, CHAT_LAYOUT.userMessagePadding)}>
                     <UserMessageBubble
                       content={turn.message.content}
                       attachments={turn.message.attachments}
@@ -180,19 +237,20 @@ export function SessionViewer({
                                turn.message.role === 'warning' ? 'warning' :
                                turn.message.role === 'info' ? 'info' : 'system'
                 return (
-                  <SystemMessage
-                    key={turn.message.id}
-                    content={turn.message.content}
-                    type={msgType}
-                  />
+                  <div key={turn.message.id} {...anchorProps} className={anchorClass}>
+                    <SystemMessage
+                      content={turn.message.content}
+                      type={msgType}
+                    />
+                  </div>
                 )
               }
 
               if (turn.type === 'assistant') {
                 const assistantUiKey = getAssistantTurnUiKey(turn, index)
                 return (
+                  <div key={assistantUiKey} {...anchorProps} className={anchorClass}>
                   <TurnCard
-                    key={assistantUiKey}
                     turnId={turn.turnId}
                     activities={turn.activities}
                     response={turn.response}
@@ -219,6 +277,7 @@ export function SessionViewer({
                     sessionFolderPath={sessionFolderPath}
                     annotationInteractionMode={mode === 'readonly' ? 'tooltip-only' : 'interactive'}
                   />
+                  </div>
                 )
               }
 

@@ -25,6 +25,7 @@ import {
   extractOverlayData,
   detectLanguage,
   openExternalUrl,
+  parseMessageAnchorFromHash,
   type PlatformActions,
   type ActivityItem,
   type OverlayData,
@@ -36,19 +37,43 @@ import { Header } from './components/Header'
 /** Default session ID for development */
 const DEV_SESSION_ID = 'tz5-13I84pwK_he'
 
-/** Extract session ID from URL path /s/{id} */
-function getSessionIdFromUrl(): string | null {
+/**
+ * Extract the session ID and optional deep-link message target from the URL.
+ *
+ * Supported shapes (see #949):
+ * - `/s/<sessionId>`                     — whole session
+ * - `/s/<sessionId>/m/<messageId>`       — session + message anchor (route segment)
+ * - `/s/<sessionId>#msg-<messageId>`     — session + message anchor (fragment)
+ *
+ * The fragment form is the primary/canonical permalink; the `/m/` route segment
+ * is accepted as an equivalent alias.
+ */
+function getUrlTarget(): { sessionId: string | null; messageId: string | null } {
   const path = window.location.pathname
-  const match = path.match(/^\/s\/([a-zA-Z0-9_-]+)$/)
-  if (match) return match[1]
+  // Prefer an explicit `/m/<messageId>` route segment, then fall back to the hash.
+  const messageIdFromHash = parseMessageAnchorFromHash(window.location.hash)
+
+  const routeMatch = path.match(/^\/s\/([a-zA-Z0-9_-]+)(?:\/m\/(.+))?\/?$/)
+  if (routeMatch) {
+    const messageIdFromRoute = routeMatch[2] ? safeDecode(routeMatch[2]) : null
+    return { sessionId: routeMatch[1], messageId: messageIdFromRoute ?? messageIdFromHash }
+  }
 
   // In development, redirect root to default session
   if (import.meta.env.DEV && path === '/') {
     window.history.replaceState({}, '', `/s/${DEV_SESSION_ID}`)
-    return DEV_SESSION_ID
+    return { sessionId: DEV_SESSION_ID, messageId: messageIdFromHash }
   }
 
-  return null
+  return { sessionId: null, messageId: messageIdFromHash }
+}
+
+function safeDecode(value: string): string {
+  try {
+    return decodeURIComponent(value)
+  } catch {
+    return value
+  }
 }
 
 export function App() {
@@ -56,7 +81,8 @@ export function App() {
   const [session, setSession] = useState<StoredSession | null>(null)
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const [sessionId, setSessionId] = useState<string | null>(() => getSessionIdFromUrl())
+  const [sessionId, setSessionId] = useState<string | null>(() => getUrlTarget().sessionId)
+  const [targetMessageId, setTargetMessageId] = useState<string | null>(() => getUrlTarget().messageId)
   const [isDark, setIsDark] = useState(() => {
     // Check system preference on mount
     return window.matchMedia('(prefers-color-scheme: dark)').matches
@@ -94,19 +120,26 @@ export function App() {
     fetchSession()
   }, [sessionId])
 
-  // Handle browser navigation
+  // Handle browser navigation (back/forward + in-page anchor changes)
   useEffect(() => {
-    const handlePopState = () => {
-      const newId = getSessionIdFromUrl()
+    const syncFromUrl = () => {
+      const { sessionId: newId, messageId } = getUrlTarget()
       setSessionId(newId)
+      setTargetMessageId(messageId)
       if (!newId) {
         setSession(null)
         setError(null)
       }
     }
 
-    window.addEventListener('popstate', handlePopState)
-    return () => window.removeEventListener('popstate', handlePopState)
+    window.addEventListener('popstate', syncFromUrl)
+    // `hashchange` fires when the user follows a `#msg-<id>` permalink within
+    // the same document (e.g. a copied link) — re-target without a full reload.
+    window.addEventListener('hashchange', syncFromUrl)
+    return () => {
+      window.removeEventListener('popstate', syncFromUrl)
+      window.removeEventListener('hashchange', syncFromUrl)
+    }
   }, [])
 
   // Apply dark mode class to html element
@@ -129,6 +162,7 @@ export function App() {
   const handleClear = useCallback(() => {
     setSession(null)
     setSessionId(null)
+    setTargetMessageId(null)
     setError(null)
     // Update URL to root
     window.history.pushState({}, '', '/')
@@ -231,6 +265,7 @@ export function App() {
           defaultExpanded={false}
           className="flex-1 min-h-0"
           onActivityClick={handleActivityClick}
+          targetMessageId={targetMessageId ?? undefined}
         />
       ) : (
         <div className="flex-1 flex items-center justify-center p-8">
