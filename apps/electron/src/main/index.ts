@@ -116,7 +116,7 @@ import { setPerfEnabled, enableDebug } from '@craft-agent/shared/utils'
 import { registerPiModelResolver } from '@craft-agent/shared/config'
 import { getPiModelsForAuthProvider, getAllPiModels } from '@craft-agent/shared/config'
 import { initNotificationService, initBadgeIcon, initInstanceBadge, updateBadgeCount } from './notifications'
-import { checkForUpdatesOnLaunch, setAutoUpdateEventSink, isUpdating, setBeforeUpdateQuitHook } from './auto-update'
+import { checkForUpdatesOnLaunch, setAutoUpdateEventSink, isUpdating, setBeforeUpdateQuitHook, setBeforeUpdateInstallHook, setInstallQuitFailedHook } from './auto-update'
 import type { EventSink } from '@craft-agent/server-core/transport'
 import { validateGitBashPath, checkVCRedistInstalled } from '@craft-agent/server-core/services'
 
@@ -783,17 +783,25 @@ app.whenReady().then(async () => {
         }
       })
 
-      // Transfer session to another workspace — orchestrated in main process
-      // so large bundles can be moved directly between owning servers.
-      ipcMain.handle('session:transferToRemoteWorkspace', async (_event, sessionId: string, targetWorkspaceId: string, sessionIndex?: number, sessionCount?: number) => {
+      // Transfer session to another workspace — orchestrated in main process so
+      // bundles can be moved directly between owning servers. Every connection is
+      // outbound from this process: remote sources/targets are reached over WS,
+      // a local target imports in-process on the embedded server — the local
+      // machine never needs to accept an inbound connection.
+      ipcMain.handle('session:transferToWorkspace', async (_event, sessionId: string, targetWorkspaceId: string, sessionIndex?: number, sessionCount?: number) => {
         const idx = sessionIndex ?? 0
         const count = sessionCount ?? 1
         const { getWorkspaceByNameOrId } = await import('@craft-agent/shared/config')
         const { connectToRemote } = await import('./handlers/workspace')
         const { CHUNKED_TRANSFER_THRESHOLD, getChunkCount, invokeChunked, prepareChunkedPayload } = await import('./chunked-rpc')
 
+        // The pull side (sessions:export) returns the whole bundle as a single
+        // unchunked response frame — up to MAX_BUNDLE_SIZE_BYTES over WAN — so
+        // the 30s default request timeout is not enough for transfer clients.
+        const TRANSFER_REQUEST_TIMEOUT_MS = 120_000
+
         const targetWorkspace = getWorkspaceByNameOrId(targetWorkspaceId)
-        if (!targetWorkspace?.remoteServer) throw new Error(`Workspace ${targetWorkspaceId} has no remote server`)
+        if (!targetWorkspace) throw new Error(`Workspace ${targetWorkspaceId} not found`)
         if (!sessionManager) throw new Error('Session manager not initialized')
 
         const sourceWorkspaceLocalId = windowManager?.getWorkspaceForWindow(_event.sender.id)
@@ -807,7 +815,7 @@ app.whenReady().then(async () => {
         if (sourceWorkspace.remoteServer) {
           const { url: sourceUrl, token: sourceToken, remoteWorkspaceId: sourceRemoteWorkspaceId } = sourceWorkspace.remoteServer
           console.log(`[Transfer] Exporting remote-owned session ${sessionId} from workspace ${sourceRemoteWorkspaceId}...`)
-          const { client: sourceClient, error: sourceError } = await connectToRemote(sourceUrl, sourceToken, sourceRemoteWorkspaceId)
+          const { client: sourceClient, error: sourceError } = await connectToRemote(sourceUrl, sourceToken, sourceRemoteWorkspaceId, { requestTimeout: TRANSFER_REQUEST_TIMEOUT_MS })
           if (!sourceClient) throw new Error(sourceError ?? 'Connection failed to source remote server')
 
           try {
@@ -848,9 +856,24 @@ app.whenReady().then(async () => {
 
         console.log(`[Transfer] Export complete: ${bundle.session?.messages?.length ?? 0} messages, ${bundle.files?.length ?? 0} files`)
 
+        const emitProgress = (chunkSent: number, chunkTotal: number) => {
+          try { _event.sender.send('transfer:progress', { sessionIndex: idx, sessionCount: count, chunkSent, chunkTotal }) } catch { /* renderer may be gone */ }
+        }
+
+        if (!targetWorkspace.remoteServer) {
+          // Local target — import in-process on the embedded server. Same method
+          // the sessions:import RPC handler runs on a remote target, so the
+          // result shape matches the remote path.
+          console.log(`[Transfer] Target workspace ${targetWorkspace.id} is local → importing in-process`)
+          emitProgress(0, 1)
+          const result = await sessionManager.importSession(targetWorkspace.id, bundle, 'fork')
+          emitProgress(1, 1)
+          return result
+        }
+
         const { url, token, remoteWorkspaceId } = targetWorkspace.remoteServer
         console.log(`[Transfer] Connecting to target remote server: ${url}`)
-        const { client, error } = await connectToRemote(url, token, remoteWorkspaceId)
+        const { client, error } = await connectToRemote(url, token, remoteWorkspaceId, { requestTimeout: TRANSFER_REQUEST_TIMEOUT_MS })
         if (!client) throw new Error(error ?? 'Connection failed to target remote server')
         console.log('[Transfer] Connected to target remote server')
 
@@ -858,10 +881,6 @@ app.whenReady().then(async () => {
           const preparedBundle = prepareChunkedPayload(bundle)
           const payloadSize = preparedBundle.bytes.length
           const payloadMB = (payloadSize / (1024 * 1024)).toFixed(1)
-
-          const emitProgress = (chunkSent: number, chunkTotal: number) => {
-            try { _event.sender.send('transfer:progress', { sessionIndex: idx, sessionCount: count, chunkSent, chunkTotal }) } catch { /* renderer may be gone */ }
-          }
 
           if (payloadSize < CHUNKED_TRANSFER_THRESHOLD) {
             console.log(`[Transfer] Bundle size: ${payloadMB}MB (< 5MB threshold) → using direct RPC`)
@@ -1090,6 +1109,29 @@ app.whenReady().then(async () => {
     // before-quit firing; saving from before-quit alone would overwrite
     // window-state.json with an empty array.
     setBeforeUpdateQuitHook(() => captureAndSaveWindowState('pre-update'))
+    // Before the installer hands off, run the full quit cleanup and mark the app
+    // as quitting so before-quit's guard returns early instead of cancelling
+    // Squirrel.Mac's quit with preventDefault (#891).
+    setBeforeUpdateInstallHook(async () => {
+      isQuitting = true
+      windowManager?.setAppQuitting(true)
+      await performQuitCleanup()
+    })
+    // If quitAndInstall throws after the cleanup above already ran, the process
+    // is a zombie: sessions flushed but no watchers/messaging/lock, and isQuitting
+    // makes the next quit skip the flush. The only honest recovery is a controlled
+    // relaunch into a fresh process (#891).
+    setInstallQuitFailedHook(() => {
+      mainLog.error('[auto-update] quitAndInstall failed after cleanup — relaunching')
+      dialog.showMessageBoxSync({
+        type: 'error',
+        title: 'Update failed',
+        message: 'The update could not be installed.',
+        detail: 'Craft Agents will restart now. The update will be retried on the next launch.',
+      })
+      app.relaunch()
+      app.exit(0)
+    })
     if (app.isPackaged) {
       checkForUpdatesOnLaunch().catch(err => {
         mainLog.error('[auto-update] Launch check failed:', err)
@@ -1167,6 +1209,60 @@ function captureAndSaveWindowState(reason: 'before-quit' | 'pre-update'): number
   return windows.length
 }
 
+// Flush sessions and release all quit-time resources. Shared by the normal quit
+// path (before-quit) and the update-install handoff (beforeUpdateInstallHook), so
+// the two cleanup sequences can't drift (#891).
+let quitCleanupRan = false
+async function performQuitCleanup(): Promise<void> {
+  // Idempotent: a failed update install may retry, and the update path plus a
+  // subsequent quit must not dispose already-disposed services.
+  if (quitCleanupRan) {
+    mainLog.info('Quit cleanup already ran, skipping')
+    return
+  }
+  quitCleanupRan = true
+
+  if (sessionManager) {
+    try {
+      await sessionManager.flushAllSessions()
+      mainLog.info('Flushed all pending session writes')
+    } catch (error) {
+      mainLog.error('Failed to flush sessions:', error)
+    }
+    // Clean up SessionManager resources (file watchers, timers, etc.)
+    sessionManager.cleanup()
+  }
+
+  // Clean up browser pane instances
+  if (browserPaneManager) {
+    browserPaneManager.destroyAll()
+  }
+
+  // Clean up OAuth flow store (stop periodic cleanup timer)
+  if (oauthFlowStore) {
+    oauthFlowStore.dispose()
+  }
+
+  // Stop all model refresh timers
+  getModelRefreshService().stopAll()
+
+  // Stop messaging gateways so the WhatsApp worker subprocess exits cleanly.
+  if (messagingHandle) {
+    try {
+      await messagingHandle.dispose()
+    } catch (err) {
+      mainLog.error('[messaging] dispose failed:', err)
+    }
+  }
+
+  // Clean up power manager (release power blocker)
+  const { cleanup: cleanupPowerManager } = await import('./power-manager')
+  cleanupPowerManager()
+
+  // Release the server lock file so the next launch doesn't see a stale PID.
+  releaseServerLock()
+}
+
 // Save window state and clean up resources before quitting
 app.on('before-quit', async (event) => {
   // Avoid re-entry when we call app.exit()
@@ -1204,58 +1300,13 @@ app.on('before-quit', async (event) => {
     }
   }
 
-  // Flush all pending session writes before quitting
+  // Normal quit: flush + clean up, then exit. The update-install path does NOT
+  // reach here — installUpdate's beforeUpdateInstallHook already ran
+  // performQuitCleanup and set isQuitting, so the guard at the top returns early
+  // and Squirrel.Mac's quit proceeds uninterrupted so the update installs (#891).
   if (sessionManager) {
-    // Prevent quit until sessions are flushed
     event.preventDefault()
-    try {
-      await sessionManager.flushAllSessions()
-      mainLog.info('Flushed all pending session writes')
-    } catch (error) {
-      mainLog.error('Failed to flush sessions:', error)
-    }
-    // Clean up SessionManager resources (file watchers, timers, etc.)
-    sessionManager.cleanup()
-
-    // Clean up browser pane instances
-    if (browserPaneManager) {
-      browserPaneManager.destroyAll()
-    }
-
-    // Clean up OAuth flow store (stop periodic cleanup timer)
-    if (oauthFlowStore) {
-      oauthFlowStore.dispose()
-    }
-
-    // Stop all model refresh timers
-    getModelRefreshService().stopAll()
-
-    // Stop messaging gateways so the WhatsApp worker subprocess exits cleanly.
-    if (messagingHandle) {
-      try {
-        await messagingHandle.dispose()
-      } catch (err) {
-        mainLog.error('[messaging] dispose failed:', err)
-      }
-    }
-
-    // Clean up power manager (release power blocker)
-    const { cleanup: cleanupPowerManager } = await import('./power-manager')
-    cleanupPowerManager()
-
-    // Release the server lock file so the next launch doesn't see a stale PID.
-    // This must happen regardless of the exit path (normal quit or update quit).
-    releaseServerLock()
-
-    // If update is in progress, let electron-updater handle the quit flow
-    // Force exit breaks the NSIS installer on Windows
-    if (isUpdating()) {
-      mainLog.info('Update in progress, letting electron-updater handle quit')
-      app.quit()
-      return
-    }
-
-    // Now actually quit
+    await performQuitCleanup()
     app.exit(0)
   }
 })
