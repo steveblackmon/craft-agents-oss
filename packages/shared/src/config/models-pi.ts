@@ -13,7 +13,7 @@
  * NEVER import this file from renderer components or from files that the renderer imports.
  */
 
-import { getProviders, getModels } from '@earendil-works/pi-ai';
+import { getProviders, getModels } from '@earendil-works/pi-ai/compat';
 import type { KnownProvider, Model, Api } from '@earendil-works/pi-ai';
 import type { ModelDefinition } from './models.ts';
 
@@ -67,19 +67,8 @@ const PI_EXCLUDED_MODEL_PREFIXES: string[] = [
   'gpt-4',
 ];
 
-export function isDeprecatedClaudeOpus46Model(modelId: string): boolean {
-  const lower = modelId.toLowerCase().replace(/^pi\//, '');
-  return lower === 'claude-opus-4-6'
-    || lower === 'claude-opus-4.6'
-    || lower === 'anthropic/claude-opus-4-6'
-    || lower === 'anthropic/claude-opus-4.6'
-    || lower.endsWith('.anthropic.claude-opus-4-6-v1')
-    || lower === 'anthropic.claude-opus-4-6-v1';
-}
-
 function isExcludedPiModel(modelId: string): boolean {
   if (PI_EXCLUDED_MODELS.has(modelId)) return true;
-  if (isDeprecatedClaudeOpus46Model(modelId)) return true;
   return PI_EXCLUDED_MODEL_PREFIXES.some(prefix => modelId.startsWith(prefix));
 }
 
