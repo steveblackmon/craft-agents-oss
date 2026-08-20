@@ -1,0 +1,66 @@
+# Weekly upstream sync: open (or refresh) a PR merging craft-ai-agents/craft-agents-oss:main
+# into this fork's main. If a manual conflict resolution is needed, resolve on the sync/upstream
+# branch — subsequent runs update the same branch/PR instead of opening new ones.
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "0 9 * * 1"   # Mondays 09:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name  "craft-agent-sync[bot]"
+          git config user.email "agents-noreply@craft.do"
+
+      - name: Add upstream + fetch
+        run: |
+          git remote add upstream https://github.com/craft-ai-agents/craft-agents-oss.git
+          git fetch upstream main
+
+      - name: Create/update sync branch
+        id: sync
+        run: |
+          set -eux
+          BR="sync/upstream-$(date -u +%Y%m%d)"
+          git switch -C "$BR"
+          # Try to merge; if conflicts, leave them in the branch for a human to resolve.
+          if git merge --no-edit --no-ff upstream/main; then
+            echo "conflicts=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflicts=true" >> "$GITHUB_OUTPUT"
+            # Commit the conflict markers so the PR is openable and reviewable.
+            git add -A
+            git commit -m "sync: upstream merge with conflicts (needs human resolution)" --allow-empty
+          fi
+          git push -f origin "$BR"
+          echo "branch=$BR" >> "$GITHUB_OUTPUT"
+
+      - name: Open or update PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eux
+          BR="${{ steps.sync.outputs.branch }}"
+          CONFLICTS="${{ steps.sync.outputs.conflicts }}"
+          TITLE="sync: merge upstream craft-ai-agents/craft-agents-oss main"
+          BODY="Automated weekly merge from craft-ai-agents/craft-agents-oss:main. Conflicts present: $CONFLICTS."
+          # Idempotent: create-or-comment
+          EXISTING=$(gh pr list --head "$BR" --state open --json number --jq '.[0].number' || true)
+          if [ -z "$EXISTING" ]; then
+            gh pr create --base main --head "$BR" --title "$TITLE" --body "$BODY"
+          else
+            gh pr comment "$EXISTING" --body "Refreshed $BR against upstream at $(date -u +%FT%TZ)."
+          fi
