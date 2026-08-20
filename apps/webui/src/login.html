@@ -265,8 +265,27 @@
         });
 
         if (res.ok) {
-          // Cookie is set by the response — redirect to app
-          window.location.href = '/';
+          // Cookie is set by the response — redirect back to the originally
+          // requested location so deep links survive first-time login.
+          //
+          // When an unauthenticated request is redirected here, the browser
+          // carries the original URL fragment over to /login (a 302 with no
+          // fragment inherits the request's fragment), so a `#msg-<id>` message
+          // anchor is still present on window.location. A `?next=` query param
+          // (same-origin path only) is also honored if the server provides one.
+          // See craft-ai-agents/craft-agents-oss#949.
+          let dest = '/';
+          try {
+            const nextParam = new URLSearchParams(window.location.search).get('next');
+            if (nextParam && nextParam.startsWith('/') && !nextParam.startsWith('//')) {
+              dest = nextParam;
+            } else if (window.location.hash) {
+              dest = '/' + window.location.hash;
+            }
+          } catch (_) {
+            dest = window.location.hash ? '/' + window.location.hash : '/';
+          }
+          window.location.href = dest;
           return;
         }
 

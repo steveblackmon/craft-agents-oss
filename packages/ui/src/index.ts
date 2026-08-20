@@ -46,6 +46,12 @@ export {
   mapToolEventToActivity,
   SIZE_CONFIG,
   ActivityStatusIcon,
+  // Message anchor / deep-link helpers (#949)
+  MESSAGE_ANCHOR_PREFIX,
+  getTurnAnchorMessageId,
+  messageAnchorDomId,
+  buildMessageAnchorHash,
+  parseMessageAnchorFromHash,
   type SessionViewerProps,
   type SessionViewerMode,
   type TurnCardProps,
