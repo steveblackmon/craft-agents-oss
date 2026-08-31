@@ -9,8 +9,8 @@
         "@anthropic-ai/sdk": "^0.100.0",
         "@dnd-kit/dom": "^0.4.0-beta-20260227032529",
         "@dnd-kit/helpers": "^0.4.0-beta-20260227032529",
-        "@earendil-works/pi-ai": "0.80.6",
-        "@earendil-works/pi-coding-agent": "0.80.6",
+        "@earendil-works/pi-ai": "0.81.1",
+        "@earendil-works/pi-coding-agent": "0.81.1",
         "@github/copilot-sdk": "^0.1.23",
         "@modelcontextprotocol/sdk": "^1.29.0",
         "@radix-ui/react-avatar": "^1.1.11",
@@ -116,7 +116,11 @@
     },
     "apps/cli": {
       "name": "@craft-agent/cli",
+<<<<<<< HEAD
       "version": "0.12.0",
+=======
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "bin": {
         "craft-cli": "src/index.ts",
       },
@@ -130,9 +134,26 @@
         "typescript": "^5.8.2",
       },
     },
+<<<<<<< HEAD
     "apps/electron": {
       "name": "@craft-agent/electron",
       "version": "0.12.0",
+=======
+    "apps/docs-site": {
+      "name": "craft-agents-docs-site",
+      "version": "0.12.1",
+      "dependencies": {
+        "@astrojs/starlight": "^0.36.0",
+        "astro": "^5.6.0",
+        "astro-auto-import": "^0.5.2",
+        "sharp": "^0.33.0",
+        "zod": "^3.25.76",
+      },
+    },
+    "apps/electron": {
+      "name": "@craft-agent/electron",
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "dependencies": {
         "@craft-agent/core": "workspace:*",
         "@craft-agent/messaging-gateway": "workspace:*",
@@ -180,9 +201,38 @@
         "@types/ws": "^8.18.1",
       },
     },
+<<<<<<< HEAD
     "apps/viewer": {
       "name": "@craft-agent/viewer",
       "version": "0.12.0",
+=======
+    "apps/marketing": {
+      "name": "@craft-agent/marketing",
+      "version": "0.12.1",
+      "dependencies": {
+        "@craft-agent/ui": "workspace:*",
+        "@paper-design/shaders-react": "^0.0.70",
+        "react": "^18.3.1",
+        "react-dom": "^18.3.1",
+        "react-router-dom": "^7.13.0",
+        "shiki": "^3.21.0",
+        "three": "^0.170.0",
+      },
+      "devDependencies": {
+        "@tailwindcss/vite": "^4.1.18",
+        "@types/react": "^18.3.0",
+        "@types/react-dom": "^18.3.0",
+        "@types/three": "^0.170.0",
+        "@vitejs/plugin-react": "^5.1.2",
+        "tailwindcss": "^4.1.18",
+        "typescript": "^5.0.0",
+        "vite": "^6.2.4",
+      },
+    },
+    "apps/viewer": {
+      "name": "@craft-agent/viewer",
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "dependencies": {
         "@craft-agent/core": "workspace:*",
         "@craft-agent/ui": "workspace:*",
@@ -210,7 +260,11 @@
     },
     "apps/webui": {
       "name": "@craft-agent/webui",
+<<<<<<< HEAD
       "version": "0.12.0",
+=======
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "dependencies": {
         "@craft-agent/shared": "workspace:*",
         "@craft-agent/ui": "workspace:*",
@@ -225,7 +279,11 @@
     },
     "packages/core": {
       "name": "@craft-agent/core",
+<<<<<<< HEAD
       "version": "0.12.0",
+=======
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "devDependencies": {
         "@types/uuid": "^11.0.0",
       },
@@ -234,9 +292,38 @@
         "@modelcontextprotocol/sdk": ">=1.29.0",
       },
     },
+<<<<<<< HEAD
     "packages/messaging-gateway": {
       "name": "@craft-agent/messaging-gateway",
       "version": "0.12.0",
+=======
+    "packages/craft-agents-commands": {
+      "name": "@craft-agent/craft-agents-commands",
+      "version": "0.12.1",
+      "dependencies": {
+        "@craft-agent/shared": "workspace:*",
+      },
+      "devDependencies": {
+        "@types/bun": "latest",
+        "@types/node": "^25.0.8",
+      },
+    },
+    "packages/craft-cli": {
+      "name": "@craft-agent/craft-cli",
+      "version": "0.12.1",
+      "dependencies": {
+        "@craft-agent/craft-agents-commands": "workspace:*",
+        "@craft-agent/shared": "workspace:*",
+      },
+      "devDependencies": {
+        "@types/bun": "latest",
+        "@types/node": "^25.0.8",
+      },
+    },
+    "packages/messaging-gateway": {
+      "name": "@craft-agent/messaging-gateway",
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "dependencies": {
         "@craft-agent/core": "workspace:*",
         "@craft-agent/messaging-whatsapp-worker": "workspace:*",
@@ -252,7 +339,11 @@
     },
     "packages/messaging-whatsapp-worker": {
       "name": "@craft-agent/messaging-whatsapp-worker",
+<<<<<<< HEAD
       "version": "0.12.0",
+=======
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "dependencies": {
         "@whiskeysockets/baileys": "^6.7.0",
       },
@@ -263,14 +354,18 @@
     },
     "packages/pi-agent-server": {
       "name": "@craft-agent/pi-agent-server",
+<<<<<<< HEAD
       "version": "0.12.0",
+=======
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "bin": {
         "pi-agent-server": "./dist/index.js",
       },
       "dependencies": {
-        "@earendil-works/pi-agent-core": "0.80.6",
-        "@earendil-works/pi-ai": "0.80.6",
-        "@earendil-works/pi-coding-agent": "0.80.6",
+        "@earendil-works/pi-agent-core": "0.81.1",
+        "@earendil-works/pi-ai": "0.81.1",
+        "@earendil-works/pi-coding-agent": "0.81.1",
         "@sinclair/typebox": "^0.34.0",
         "duck-duck-scrape": "^2.2.7",
         "node-html-parser": "^6.1.0",
@@ -283,7 +378,11 @@
     },
     "packages/server": {
       "name": "@craft-agent/server",
+<<<<<<< HEAD
       "version": "0.12.0",
+=======
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "bin": {
         "craft-server": "src/index.ts",
       },
@@ -301,11 +400,15 @@
     },
     "packages/server-core": {
       "name": "@craft-agent/server-core",
+<<<<<<< HEAD
       "version": "0.12.0",
+=======
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "dependencies": {
         "@craft-agent/core": "workspace:*",
         "@craft-agent/shared": "workspace:*",
-        "@earendil-works/pi-ai": "0.80.6",
+        "@earendil-works/pi-ai": "0.81.1",
         "jose": "^6.0.0",
         "sharp": "0.34.5",
         "ws": "^8.19.0",
@@ -317,7 +420,11 @@
     },
     "packages/session-mcp-server": {
       "name": "@craft-agent/session-mcp-server",
+<<<<<<< HEAD
       "version": "0.12.0",
+=======
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "bin": {
         "session-mcp-server": "./dist/index.js",
       },
@@ -333,7 +440,11 @@
     },
     "packages/session-tools-core": {
       "name": "@craft-agent/session-tools-core",
+<<<<<<< HEAD
       "version": "0.12.0",
+=======
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "dependencies": {
         "beautiful-mermaid": "*",
         "gray-matter": "^4.0.3",
@@ -346,13 +457,17 @@
     },
     "packages/shared": {
       "name": "@craft-agent/shared",
+<<<<<<< HEAD
       "version": "0.12.0",
+=======
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "dependencies": {
         "@craft-agent/core": "workspace:*",
         "@craft-agent/session-tools-core": "workspace:*",
-        "@earendil-works/pi-agent-core": "0.80.6",
-        "@earendil-works/pi-ai": "0.80.6",
-        "@earendil-works/pi-coding-agent": "0.80.6",
+        "@earendil-works/pi-agent-core": "0.81.1",
+        "@earendil-works/pi-ai": "0.81.1",
+        "@earendil-works/pi-coding-agent": "0.81.1",
         "@isaacs/ttlcache": "^2.1.4",
         "@leeoniya/ufuzzy": "^1.0.19",
         "bash-parser": "^0.5.0",
@@ -377,7 +492,11 @@
     },
     "packages/ui": {
       "name": "@craft-agent/ui",
+<<<<<<< HEAD
       "version": "0.12.0",
+=======
+      "version": "0.12.1",
+>>>>>>> upstream/main
       "dependencies": {
         "@craft-agent/core": "workspace:*",
         "@craft-agent/shared": "workspace:*",
@@ -682,13 +801,13 @@
 
     "@dnd-kit/utilities": ["@dnd-kit/utilities@3.2.2", "", { "dependencies": { "tslib": "^2.0.0" }, "peerDependencies": { "react": ">=16.8.0" } }, "sha512-+MKAJEOfaBe5SmV6t34p80MMKhjvUz0vRrvVJbPT0WElzaOJ/1xs+D+KDv+tD/NE5ujfrChEcshd4fLn0wpiqg=="],
 
-    "@earendil-works/pi-agent-core": ["@earendil-works/pi-agent-core@0.80.6", "", { "dependencies": { "@earendil-works/pi-ai": "^0.80.6", "ignore": "7.0.5", "typebox": "1.1.38", "yaml": "2.9.0" } }, "sha512-Lvn89ko42h5ETUb6Z0Ku6ldskEqXaTdQBYvSa0+7bdG9V6rUEpXptv5e0OVZ1HDcvi8s6/2lGCQWsxKX+DFHNw=="],
+    "@earendil-works/pi-agent-core": ["@earendil-works/pi-agent-core@0.81.1", "", { "dependencies": { "@earendil-works/pi-ai": "^0.81.1", "ignore": "7.0.5", "typebox": "1.1.38", "yaml": "2.9.0" } }, "sha512-yqbh68CyhqxMov/jUogFJfMqlu2Gd37GAki+tr59YCmAPHfomiCA5ESzusXtpGzABeiZFC/OrRdQ4GwCCOMIHA=="],
 
-    "@earendil-works/pi-ai": ["@earendil-works/pi-ai@0.80.6", "", { "dependencies": { "@anthropic-ai/sdk": "0.91.1", "@aws-sdk/client-bedrock-runtime": "3.1048.0", "@google/genai": "1.52.0", "@mistralai/mistralai": "2.2.6", "@opentelemetry/api": "1.9.0", "@smithy/node-http-handler": "4.7.3", "http-proxy-agent": "7.0.2", "https-proxy-agent": "7.0.6", "openai": "6.26.0", "partial-json": "0.1.7", "typebox": "1.1.38" }, "bin": { "pi-ai": "dist/cli.js" } }, "sha512-7xfLk8sANBp+bpPEbjoOZTbPxsa+++b1JXAoSJsNa3vbs9AHHEclmvg54XLQcxH+fuwaeti/g2jeIfJ+mVYLpA=="],
+    "@earendil-works/pi-ai": ["@earendil-works/pi-ai@0.81.1", "", { "dependencies": { "@anthropic-ai/sdk": "0.91.1", "@aws-sdk/client-bedrock-runtime": "3.1048.0", "@google/genai": "1.52.0", "@mistralai/mistralai": "2.2.6", "@opentelemetry/api": "1.9.0", "@smithy/node-http-handler": "4.7.3", "http-proxy-agent": "7.0.2", "https-proxy-agent": "7.0.6", "openai": "6.26.0", "partial-json": "0.1.7", "typebox": "1.1.38" }, "bin": { "pi-ai": "dist/cli.js" } }, "sha512-hzHE7Z8l5mgJk+ke67Lge0rwS2+wbKJrFKl9o5M1R1rh33+cCT7D1AHz1OAtX5wFs90E1/BTGhyJRTUHaMxGvQ=="],
 
-    "@earendil-works/pi-coding-agent": ["@earendil-works/pi-coding-agent@0.80.6", "", { "dependencies": { "@earendil-works/pi-agent-core": "^0.80.6", "@earendil-works/pi-ai": "^0.80.6", "@earendil-works/pi-tui": "^0.80.6", "@silvia-odwyer/photon-node": "0.3.4", "chalk": "5.6.2", "cross-spawn": "7.0.6", "diff": "8.0.4", "glob": "13.0.6", "highlight.js": "10.7.3", "hosted-git-info": "9.0.3", "ignore": "7.0.5", "jiti": "2.7.0", "minimatch": "10.2.5", "proper-lockfile": "4.1.2", "semver": "7.8.0", "typebox": "1.1.38", "undici": "8.5.0", "yaml": "2.9.0" }, "optionalDependencies": { "@mariozechner/clipboard": "0.3.9" }, "bin": { "pi": "dist/cli.js" } }, "sha512-vcfD6tOk402isLl3Cm/qbn2O10TvgroMp1+/fEGM24ZdvETFCdOYv5VZ7m59EI5fPsjfSJh+CpQ5bhBrhfOg7g=="],
+    "@earendil-works/pi-coding-agent": ["@earendil-works/pi-coding-agent@0.81.1", "", { "dependencies": { "@earendil-works/pi-agent-core": "^0.81.1", "@earendil-works/pi-ai": "^0.81.1", "@earendil-works/pi-tui": "^0.81.1", "@silvia-odwyer/photon-node": "0.3.4", "chalk": "5.6.2", "cross-spawn": "7.0.6", "diff": "8.0.4", "glob": "13.0.6", "highlight.js": "10.7.3", "hosted-git-info": "9.0.3", "ignore": "7.0.5", "jiti": "2.7.0", "minimatch": "10.2.5", "proper-lockfile": "4.1.2", "semver": "7.8.0", "typebox": "1.1.38", "undici": "8.5.0", "yaml": "2.9.0" }, "optionalDependencies": { "@mariozechner/clipboard": "0.3.9" }, "bin": { "pi": "dist/cli.js" } }, "sha512-r6ovAsZOgAqbC/aU6s+/dPnv/sGZBuWyZNvi3pXjpbuX5wvp3XvGkQI7/VLvX2o9XpmpFaPUxKNym1WfkN/P8A=="],
 
-    "@earendil-works/pi-tui": ["@earendil-works/pi-tui@0.80.6", "", { "dependencies": { "get-east-asian-width": "1.6.0", "marked": "18.0.5" } }, "sha512-bSuzS4EVSqEPj/Qr/p9eqCESfKsGuDNbl77EGci8Iaqqt/C/XCBZL1MjXaxSWW1NsT5afjp/Cb0NTPzOLv/aPA=="],
+    "@earendil-works/pi-tui": ["@earendil-works/pi-tui@0.81.1", "", { "dependencies": { "get-east-asian-width": "1.6.0", "marked": "18.0.5" } }, "sha512-OMEe+Zt8oQYi/rCq3upxsTlIScWL0FPhXwQus34TbQb3EmTx88S7Uzx32JxvQiEeWOw8eDCdJf2PBUBE9r6wIg=="],
 
     "@electron/asar": ["@electron/asar@4.0.1", "", { "dependencies": { "commander": "^13.1.0", "glob": "^11.0.1", "minimatch": "^10.0.1" }, "bin": { "asar": "bin/asar.mjs" } }, "sha512-F4Ykm1jiBGY1WV/o8Q8oFW8Nq0u+S2/vPujzNJtdSJ6C4LHC4CiGLn7c17s7SolZ23gcvCebMncmZtNc+MkxPQ=="],
 
@@ -3682,6 +3801,15 @@
 
     "@craft-agent/cli/@types/node": ["@types/node@22.19.6", "", { "dependencies": { "undici-types": "~6.21.0" } }, "sha512-qm+G8HuG6hOHQigsi7VGuLjUVu6TtBo/F05zvX04Mw2uCg9Dv0Qxy3Qw7j41SidlTcl5D/5yg0SEZqOB+EqZnQ=="],
 
+<<<<<<< HEAD
+=======
+    "@craft-agent/craft-agents-commands/@types/bun": ["@types/bun@1.4.0", "", { "dependencies": { "bun-types": "1.4.0" } }, "sha512-K+lZULY23vRgK/CfTjFIV+tyifaNdSMlPh9j+6mQ/cLfpOznLyAuzgV/JQysyECpkBQLVMSyvjlr2fBUSA9wFQ=="],
+
+    "@craft-agent/craft-cli/@types/bun": ["@types/bun@1.4.0", "", { "dependencies": { "bun-types": "1.4.0" } }, "sha512-K+lZULY23vRgK/CfTjFIV+tyifaNdSMlPh9j+6mQ/cLfpOznLyAuzgV/JQysyECpkBQLVMSyvjlr2fBUSA9wFQ=="],
+
+    "@craft-agent/marketing/@paper-design/shaders-react": ["@paper-design/shaders-react@0.0.70", "", { "dependencies": { "@paper-design/shaders": "0.0.70" }, "peerDependencies": { "@types/react": "^18 || ^19", "react": "^18 || ^19" }, "optionalPeers": ["@types/react"] }, "sha512-9DkZXcyehorsZzyWnYV3OOO1i7rF7a5CkasjKJ1h1tLlY3JJLUEX9W+gZz7JgWHyvCimUu0OSq1sbHTb2OntRw=="],
+
+>>>>>>> upstream/main
     "@craft-agent/messaging-gateway/@types/node": ["@types/node@22.19.6", "", { "dependencies": { "undici-types": "~6.21.0" } }, "sha512-qm+G8HuG6hOHQigsi7VGuLjUVu6TtBo/F05zvX04Mw2uCg9Dv0Qxy3Qw7j41SidlTcl5D/5yg0SEZqOB+EqZnQ=="],
 
     "@craft-agent/messaging-whatsapp-worker/@types/node": ["@types/node@22.19.6", "", { "dependencies": { "undici-types": "~6.21.0" } }, "sha512-qm+G8HuG6hOHQigsi7VGuLjUVu6TtBo/F05zvX04Mw2uCg9Dv0Qxy3Qw7j41SidlTcl5D/5yg0SEZqOB+EqZnQ=="],
@@ -4168,6 +4296,15 @@
 
     "@craft-agent/cli/@types/node/undici-types": ["undici-types@6.21.0", "", {}, "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ=="],
 
+<<<<<<< HEAD
+=======
+    "@craft-agent/craft-agents-commands/@types/bun/bun-types": ["bun-types@1.4.0", "", { "dependencies": { "@types/node": "*" } }, "sha512-iIKw23BspnQQYd3prITOBxeUsxBHnwzX6YJfGMuNOZzeNcMmVqzIIVGRm1l69ogaPQmb4wB6BN8mA5bE9YuC5Q=="],
+
+    "@craft-agent/craft-cli/@types/bun/bun-types": ["bun-types@1.4.0", "", { "dependencies": { "@types/node": "*" } }, "sha512-iIKw23BspnQQYd3prITOBxeUsxBHnwzX6YJfGMuNOZzeNcMmVqzIIVGRm1l69ogaPQmb4wB6BN8mA5bE9YuC5Q=="],
+
+    "@craft-agent/marketing/@paper-design/shaders-react/@paper-design/shaders": ["@paper-design/shaders@0.0.70", "", {}, "sha512-d9LQcmPoEm3+Y6Vuz7cvsnSelfTM5QD63yQ3ddLM7QGYfoSjbQiU38kzjA4O3oCQ6zv23o/IGvGA8k9S/L+kZw=="],
+
+>>>>>>> upstream/main
     "@craft-agent/messaging-gateway/@types/node/undici-types": ["undici-types@6.21.0", "", {}, "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ=="],
 
     "@craft-agent/messaging-whatsapp-worker/@types/node/undici-types": ["undici-types@6.21.0", "", {}, "sha512-iwDZqg0QAGrg9Rav5H4n0M64c3mkR59cJ6wQp+7C4nI0gsmExaedaYLNO44eT4AtBBwjbTiGPMlt2Md0T9H9JQ=="],
