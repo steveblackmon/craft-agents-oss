@@ -1199,6 +1199,24 @@ export function resolveMidStreamDeliveryOutcome(
   }
 }
 
+/**
+ * Headers to authenticate against the self-hosted share server when it is gated
+ * behind HTTP Basic auth (`CRAFT_SHARE_BASIC_AUTH=user:pass`). SessionManager
+ * runs in the same process as the share server (packages/server/src/index.ts →
+ * startShareHttpServer), so when the gate is on every `/s/api` call it makes to
+ * mint / update / revoke a share must present the same credentials or the
+ * request 401s. Parsing mirrors `parseShareBasicAuth` (split on the first ':';
+ * password may contain ':'). Returns `{}` when the gate is unset or the value is
+ * malformed, preserving upstream (no-auth) behavior.
+ */
+function shareServerAuthHeaders(): Record<string, string> {
+  const raw = process.env.CRAFT_SHARE_BASIC_AUTH
+  if (raw == null || raw.trim() === '') return {}
+  const idx = raw.indexOf(':')
+  if (idx <= 0 || idx === raw.length - 1) return {}
+  return { Authorization: `Basic ${Buffer.from(raw).toString('base64')}` }
+}
+
 export class SessionManager implements ISessionManager {
   private sessions: Map<string, ManagedSession> = new Map()
   // Delta batching for performance - reduces IPC events from 50+/sec to ~20/sec
@@ -4882,7 +4900,7 @@ export class SessionManager implements ISessionManager {
       const { VIEWER_URL } = await import('@craft-agent/shared/branding')
       const response = await fetch(`${VIEWER_URL}/s/api`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...shareServerAuthHeaders() },
         body: JSON.stringify(storedSession)
       })
 
@@ -4946,7 +4964,7 @@ export class SessionManager implements ISessionManager {
       const { VIEWER_URL } = await import('@craft-agent/shared/branding')
       const response = await fetch(`${VIEWER_URL}/s/api/${managed.sharedId}`, {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...shareServerAuthHeaders() },
         body: JSON.stringify(storedSession)
       })
 
@@ -4991,7 +5009,7 @@ export class SessionManager implements ISessionManager {
       const { VIEWER_URL } = await import('@craft-agent/shared/branding')
       const response = await fetch(
         `${VIEWER_URL}/s/api/${managed.sharedId}`,
-        { method: 'DELETE' }
+        { method: 'DELETE', headers: shareServerAuthHeaders() }
       )
 
       if (!response.ok) {
@@ -5691,7 +5709,7 @@ export class SessionManager implements ISessionManager {
         const { VIEWER_URL } = await import('@craft-agent/shared/branding')
         const response = await fetch(
           `${VIEWER_URL}/s/api/${managed.sharedId}`,
-          { method: 'DELETE', signal: AbortSignal.timeout(5000) }
+          { method: 'DELETE', headers: shareServerAuthHeaders(), signal: AbortSignal.timeout(5000) }
         )
         if (!response.ok) {
           sessionLog.warn(`Failed to revoke share for ${sessionId}: HTTP ${response.status}`)
