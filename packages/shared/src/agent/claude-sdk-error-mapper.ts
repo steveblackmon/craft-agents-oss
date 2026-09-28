@@ -3,6 +3,13 @@ import type { AgentError } from './errors.ts';
 import type { LastApiError } from '../interceptor-common.ts';
 import { getProviderMetadata, getProviderDisplayName } from '../config/provider-metadata.ts';
 
+// SDK 0.3.280 did not include these codes in the union type, but the Anthropic
+// backend can still return them. Accept them explicitly rather than widening to string.
+type ExtendedSDKAssistantMessageError =
+  | SDKAssistantMessageError
+  | 'verification_required'
+  | 'cloud_credential_error';
+
 export interface ClaudeSdkApiError {
   errorType: string;
   message: string;
@@ -169,7 +176,7 @@ function buildApiDetails(context: ClaudeSdkErrorContext): string[] {
   return details;
 }
 
-function classifyFailure(errorCode: SDKAssistantMessageError, context: ClaudeSdkErrorContext): FailureKind {
+function classifyFailure(errorCode: ExtendedSDKAssistantMessageError, context: ClaudeSdkErrorContext): FailureKind {
   const status = context.capturedApiError?.status;
   const actualType = normalize(context.actualError?.errorType);
   const actualMessage = normalize(context.actualError?.message);
@@ -208,7 +215,7 @@ function classifyFailure(errorCode: SDKAssistantMessageError, context: ClaudeSdk
 }
 
 export function mapClaudeSdkAssistantError(
-  errorCode: SDKAssistantMessageError,
+  errorCode: ExtendedSDKAssistantMessageError,
   context: ClaudeSdkErrorContext,
 ): AgentError {
   const apiDetails = buildApiDetails(context);
@@ -272,6 +279,42 @@ export function mapClaudeSdkAssistantError(
         message: 'Your account has a billing issue.',
         details: ['Check your account billing status'],
         actions: [{ key: 's', label: 'Update credentials', action: 'settings' }],
+        canRetry: false,
+        providerInfo,
+      };
+
+    case 'verification_required':
+      return {
+        code: 'invalid_credentials',
+        title: 'Verification Required',
+        message: 'Anthropic requires your account or organization to complete verification before this request can run.',
+        details: [
+          ...apiDetails,
+          'Complete verification in the Anthropic Console, then retry',
+          'Some models and features are only available to verified organizations',
+        ],
+        actions: [
+          { key: 's', label: 'Settings', action: 'settings' },
+          { key: 'r', label: 'Retry', action: 'retry' },
+        ],
+        canRetry: false,
+        providerInfo,
+      };
+
+    case 'cloud_credential_error':
+      return {
+        code: 'invalid_credentials',
+        title: 'Cloud Credential Error',
+        message: 'The cloud provider credentials used for this connection were rejected.',
+        details: [
+          ...apiDetails,
+          'Check the AWS, Google Cloud, or Azure credentials configured for this connection',
+          'Cloud credentials often expire and need to be refreshed',
+        ],
+        actions: [
+          { key: 's', label: 'Settings', action: 'settings' },
+          { key: 'r', label: 'Retry', action: 'retry' },
+        ],
         canRetry: false,
         providerInfo,
       };

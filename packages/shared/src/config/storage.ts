@@ -24,6 +24,12 @@ import { isValidThinkingLevel, normalizeThinkingLevel } from '../agent/thinking-
 import { parsePermissionMode, PERMISSION_MODE_ORDER } from '../agent/mode-types.ts';
 import { type ConfigDefaults } from './config-defaults-schema.ts';
 import { isValidThemeFile } from './validators.ts';
+import {
+  mergeDecisionLayerSettings,
+  normalizeDecisionLayerSettings,
+  type DecisionLayerSettings,
+  type DecisionLayerStoredSettings,
+} from '../decisions/settings.ts';
 
 // Re-export CONFIG_DIR for convenience (centralized in paths.ts)
 export { CONFIG_DIR } from './paths.ts';
@@ -83,6 +89,8 @@ export interface StoredConfig {
   enable1MContext?: boolean;  // Enable 1M context window for supported models (default: false — opt-in; requires Anthropic Tier 4+)
   // Token optimization
   rtkEnabled?: boolean;  // Route Bash commands through rtk to compress tool output (default: false). https://github.com/rtk-ai/rtk
+  // Decision layer (Jev / TypeSafe System One) — opt-in, off by default. See src/decisions/.
+  decisionLayer?: DecisionLayerStoredSettings;
   // Network proxy
   networkProxy?: import('./types.ts').NetworkProxySettings;
   // Windows: path to Git Bash (bash.exe) for the SDK subprocess
@@ -585,6 +593,32 @@ export function setRtkEnabled(enabled: boolean): void {
   if (!config) return;
   config.rtkEnabled = enabled;
   saveConfig(config);
+}
+
+/**
+ * Decision layer (Jev / TypeSafe System One) settings with defaults applied.
+ * Off by default; the `enabled` switch is the only master gate.
+ * See `src/decisions/settings.ts` for the shape and `src/decisions/resolve.ts` for how it is used.
+ */
+export function getDecisionLayerSettings(): DecisionLayerSettings {
+  const config = loadStoredConfig();
+  return normalizeDecisionLayerSettings(config?.decisionLayer);
+}
+
+/**
+ * Merge a settings patch (features merge key-wise; `null` clears an optional
+ * string) and persist. Returns the normalized result.
+ */
+export function setDecisionLayerSettings(patch: Partial<Record<keyof DecisionLayerStoredSettings, unknown>>): DecisionLayerSettings {
+  const config = loadStoredConfig();
+  if (!config) {
+    // Unlike the void rtk setter, callers display the returned value — do not
+    // pretend a write happened.
+    throw new Error('Cannot save decision model settings: config.json is not initialized');
+  }
+  config.decisionLayer = mergeDecisionLayerSettings(config.decisionLayer, patch);
+  saveConfig(config);
+  return normalizeDecisionLayerSettings(config.decisionLayer);
 }
 
 /**
@@ -1822,8 +1856,11 @@ function backfillAllConnectionModels(config: StoredConfig): boolean {
   return changed;
 }
 
-const OPUS_DEFAULT_ID = 'claude-opus-4-8';
-const OPUS_FALLBACK_ID = 'claude-opus-4-7';
+// Targets of the legacy Opus migrations (4.5 / 4.7 -> 4.8) and of the Bedrock
+// catalog fallback. Deliberately NOT the current DEFAULT_MODEL (Opus 5.5):
+// existing connections keep their pinned Opus; only new connections get 5.5.
+const OPUS_48_ID = 'claude-opus-4-8';
+const OPUS_47_ID = 'claude-opus-4-7';
 
 function defaultModelIdsForConnection(connection: LlmConnection): Set<string> {
   return new Set(
@@ -1844,10 +1881,10 @@ function normalizeConnectionModelId(connection: LlmConnection, modelId: string):
     const prefixedCandidate = `pi/${native}`;
     const candidate = hasPiPrefix || defaults.has(prefixedCandidate) ? prefixedCandidate : native;
 
-    // Pi 0.73.1 does not yet expose Opus 4.8. Keep 4.7 as the selectable fallback
-    // until the upstream catalog adds 4.8; the preferred-default list is already future-proofed.
-    if (bare === OPUS_DEFAULT_ID || native.endsWith(`.${OPUS_DEFAULT_ID}`)) {
-      const fallbackNative = toBedrockNativeId(OPUS_FALLBACK_ID);
+    // Safety net for Pi catalogs that lack Opus 4.8 (pre-0.8x SDK pins): keep 4.7
+    // as the selectable fallback instead of a dangling id.
+    if (bare === OPUS_48_ID || native.endsWith(`.${OPUS_48_ID}`)) {
+      const fallbackNative = toBedrockNativeId(OPUS_47_ID);
       const prefixedFallback = `pi/${fallbackNative}`;
       const fallback = defaults.has(prefixedFallback) ? prefixedFallback : fallbackNative;
       if (!defaults.has(candidate) && defaults.has(fallback)) return fallback;
@@ -1861,14 +1898,14 @@ function normalizeConnectionModelId(connection: LlmConnection, modelId: string):
     const bare = hasPiPrefix ? normalized.slice(3) : normalized;
     const prefixedCandidate = `pi/${bare}`;
     const candidate = hasPiPrefix || defaults.has(prefixedCandidate) ? prefixedCandidate : normalized;
-    const prefixedFallback = `pi/${OPUS_FALLBACK_ID}`;
-    const fallback = defaults.has(prefixedFallback) ? prefixedFallback : OPUS_FALLBACK_ID;
-    if ((bare === OPUS_DEFAULT_ID)
+    const prefixedFallback = `pi/${OPUS_47_ID}`;
+    const fallback = defaults.has(prefixedFallback) ? prefixedFallback : OPUS_47_ID;
+    if ((bare === OPUS_48_ID)
       && !defaults.has(candidate)
       && defaults.has(fallback)) {
       return fallback;
     }
-    if (bare === OPUS_DEFAULT_ID && candidate !== normalized) {
+    if (bare === OPUS_48_ID && candidate !== normalized) {
       return candidate;
     }
   }
@@ -1887,15 +1924,15 @@ function withUpdatedModelEntry(
   nextId: string,
 ): ModelDefinition | string {
   if (typeof entry === 'string') {
-    if (connection.providerType === 'anthropic' && nextId === OPUS_DEFAULT_ID) {
-      return { ...getModelById(OPUS_DEFAULT_ID)! };
+    if (connection.providerType === 'anthropic' && nextId === OPUS_48_ID) {
+      return { ...getModelById(OPUS_48_ID)! };
     }
     return nextId;
   }
 
   const nextEntry: ModelDefinition = { ...entry, id: nextId };
-  if (connection.providerType === 'anthropic' && nextId === OPUS_DEFAULT_ID) {
-    return { ...getModelById(OPUS_DEFAULT_ID)! };
+  if (connection.providerType === 'anthropic' && nextId === OPUS_48_ID) {
+    return { ...getModelById(OPUS_48_ID)! };
   }
   if (nextEntry.name && /Opus 4\.[56]/.test(nextEntry.name)) {
     nextEntry.name = displayNameForMigratedModel(nextId);
@@ -1904,14 +1941,15 @@ function withUpdatedModelEntry(
 }
 
 function modelEntryForDefault(connection: LlmConnection, modelId: string): ModelDefinition | string {
-  if (connection.providerType === 'anthropic' && modelId === OPUS_DEFAULT_ID) {
-    return { ...getModelById(OPUS_DEFAULT_ID)! };
+  if (connection.providerType === 'anthropic' && modelId === OPUS_48_ID) {
+    return { ...getModelById(OPUS_48_ID)! };
   }
   return modelId;
 }
 
 /**
- * Migrate deprecated Opus 4.5/4.6 IDs and previous direct-Anthropic Opus 4.7 defaults to the current default Opus model.
+ * Migrate deprecated Opus 4.5 IDs and previous direct-Anthropic Opus 4.7 defaults to Opus 4.8.
+ * Opus 5.5 (the default for new connections) is intentionally not force-migrated.
  * Custom/compat endpoints are intentionally skipped because provider-specific aliases may differ.
  */
 function migrateLegacyOpusToDefaultOpus(config: StoredConfig): boolean {
@@ -1927,8 +1965,8 @@ function migrateLegacyOpusToDefaultOpus(config: StoredConfig): boolean {
       // The previous direct-Anthropic default was Opus 4.7. Move existing
       // direct-Anthropic defaults to Opus 4.8 while keeping 4.7 in the model list.
       // Pi stays on 4.7 until the current Pi catalog exposes 4.8.
-      if (connection.providerType === 'anthropic' && normalizedDefault === OPUS_FALLBACK_ID) {
-        normalizedDefault = OPUS_DEFAULT_ID;
+      if (connection.providerType === 'anthropic' && normalizedDefault === OPUS_47_ID) {
+        normalizedDefault = OPUS_48_ID;
       }
       if (normalizedDefault !== connection.defaultModel) {
         connection.defaultModel = normalizedDefault;
@@ -2027,7 +2065,7 @@ function restoreOpus46ToAnthropicConnections(config: StoredConfig): boolean {
     if (alreadyRan) continue;
 
     const ids = connection.models.map(m => typeof m === 'string' ? m : m.id);
-    if ((ids.includes(OPUS_DEFAULT_ID) || ids.includes(OPUS_FALLBACK_ID)) && !ids.includes(OPUS_46_ID)) {
+    if ((ids.includes(OPUS_48_ID) || ids.includes(OPUS_47_ID)) && !ids.includes(OPUS_46_ID)) {
       connection.models.push({ ...opus46Model });
       changed = true;
     }
@@ -2130,7 +2168,7 @@ function migrateWorkspaceLegacyOpusToDefaultOpus(config: StoredConfig): void {
     if (!wsConfig?.defaults?.model) continue;
 
     const normalized = normalizeDeprecatedModelId(wsConfig.defaults.model);
-    const nextModel = normalized === OPUS_FALLBACK_ID ? OPUS_DEFAULT_ID : normalized;
+    const nextModel = normalized === OPUS_47_ID ? OPUS_48_ID : normalized;
     if (nextModel !== wsConfig.defaults.model) {
       wsConfig.defaults.model = nextModel;
       saveWorkspaceConfig(workspace.rootPath, wsConfig);

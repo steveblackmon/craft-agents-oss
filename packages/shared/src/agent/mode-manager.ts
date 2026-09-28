@@ -34,6 +34,7 @@ import {
   type PowerShellValidationResult,
   type PowerShellValidationReason,
 } from './powershell-validator.ts';
+import { sanitizePromptLine } from '../prompts/prompt-sanitize.ts';
 import {
   type PermissionMode,
   type ModeConfig,
@@ -127,8 +128,12 @@ function expandHome(path: string): string {
  * Supports: ** (recursive), * (single segment), ? (single char)
  */
 function globToRegex(pattern: string): RegExp {
-  // Expand ~ in pattern
-  const expandedPattern = expandHome(pattern);
+  // Expand ~ then apply the same case/separator normalization used on paths so
+  // that patterns match on Windows (backslash separators, case-insensitive FS).
+  const expanded = expandHome(pattern);
+  const expandedPattern = process.platform === 'win32'
+    ? expanded.replace(/\\/g, '/').toLowerCase()
+    : expanded;
 
   // Escape special regex chars except glob wildcards
   let regex = expandedPattern
@@ -142,9 +147,13 @@ function globToRegex(pattern: string): RegExp {
 }
 
 /**
- * Check if a path matches any of the allowed write path patterns
+ * Whether a file path matches any of the workspace's `allowedWritePaths` globs.
+ *
+ * Exported so Ask mode (`core/pre-tool-use.ts:shouldPromptInAskMode`) suppresses
+ * the write prompt for exactly the paths Explore mode auto-allows: one matcher,
+ * one allowlist semantics.
  */
-function matchesAllowedWritePath(filePath: string, allowedPaths: string[]): boolean {
+export function matchesAllowedWritePath(filePath: string, allowedPaths: string[]): boolean {
   // Normalize path (expand ~, resolve, and use forward slashes)
   const normalizedPath = normalizeForComparison(expandHome(filePath));
 
@@ -1774,7 +1783,7 @@ export function isApiEndpointAllowed(
  */
 const ALWAYS_ALLOWED_TOOLS = new Set([
   'Read', 'Glob', 'Grep',           // File reading
-  'Task', 'TaskOutput',             // Agent orchestration
+  'Task',                           // Agent orchestration (TaskOutput was removed in Claude Code 2.1.269)
   'WebFetch', 'WebSearch',          // Web research
   'TodoWrite',                      // Task tracking
   'SubmitPlan',                     // Plan submission
@@ -2009,6 +2018,9 @@ export function shouldAllowToolInMode(
       const safeAllowedSessionTools = getSessionSafeAllowedToolNames({
         prefix: 'mcp__session__',
         includeDeveloperFeedback: FEATURE_FLAGS.developerFeedback,
+        // Classification, not visibility: `decide` is read-only and Explore-safe
+        // whenever the backend advertised it.
+        includeDecide: true,
       });
 
       if (safeAllowedSessionTools.has(toolName)) {
@@ -2136,7 +2148,8 @@ export function formatSessionState(
 
   // Use canonical user-facing mode tokens to avoid terminology drift.
   const modeName = toCanonicalPermissionMode(diagnostics.permissionMode);
-  let result = `<session_state>\nsessionId: ${sessionId}\npermissionMode: ${modeName}`;
+  const sessionStateTags = ['session_state'] as const;
+  let result = `<session_state>\nsessionId: ${sanitizePromptLine(sessionId, sessionStateTags)}\npermissionMode: ${modeName}`;
 
   if (diagnostics.transitionDisplay) {
     result += `\nmodeTransition: ${diagnostics.transitionDisplay}`;
@@ -2158,12 +2171,12 @@ export function formatSessionState(
 
   // Always include plans folder path so agent knows where plans are stored
   if (options?.plansFolderPath) {
-    result += `\nplansFolderPath: ${options.plansFolderPath}`;
+    result += `\nplansFolderPath: ${sanitizePromptLine(options.plansFolderPath, sessionStateTags)}`;
   }
 
   // Include data folder path so agent knows where transform_data output goes
   if (options?.dataFolderPath) {
-    result += `\ndataFolderPath: ${options.dataFolderPath}`;
+    result += `\ndataFolderPath: ${sanitizePromptLine(options.dataFolderPath, sessionStateTags)}`;
   }
 
   result += '\n</session_state>';
