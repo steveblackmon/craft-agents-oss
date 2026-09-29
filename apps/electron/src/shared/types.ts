@@ -70,6 +70,15 @@ export type { ExportResourcesOptions, ExportResult, ResourceImportMode, Resource
 // LLM connection types
 import type { LlmConnection, LlmConnectionWithStatus, LlmAuthType, LlmProviderType, NetworkProxySettings } from '@craft-agent/shared/config';
 export type { LlmConnection, LlmConnectionWithStatus, LlmAuthType, LlmProviderType, NetworkProxySettings };
+import type {
+  DecisionLayerSettings,
+  DecisionLayerSettingsPatch,
+  DecisionLayerStatus,
+  DecisionProviderId,
+  DecisionServerProbe,
+  DecisionTestResult,
+} from '@craft-agent/shared/decisions';
+export type { DecisionLayerSettings, DecisionLayerSettingsPatch, DecisionLayerStatus, DecisionProviderId, DecisionServerProbe, DecisionTestResult };
 
 // =============================================================================
 // GUI-only types (not used by server/handler code)
@@ -254,7 +263,8 @@ export interface ElectronAPI {
   respondToCredential(sessionId: string, requestId: string, response: CredentialResponse): Promise<boolean>
 
   // Consolidated session command handler
-  sessionCommand(sessionId: string, command: SessionCommand): Promise<void | ShareResult | RefreshTitleResult | { count: number }>
+  sessionCommand(sessionId: string, command: Extract<SessionCommand, { type: 'markPendingPlanExecutionDispatched' }>): Promise<boolean>
+  sessionCommand(sessionId: string, command: Exclude<SessionCommand, { type: 'markPendingPlanExecutionDispatched' }>): Promise<void | ShareResult | RefreshTitleResult | { count: number }>
 
   // Server info (REMOTE_ELIGIBLE — returns data from whichever server owns the workspace)
   getServerHomeDir(): Promise<string>
@@ -584,6 +594,16 @@ export interface ElectronAPI {
   setRtkEnabled(enabled: boolean): Promise<void>
   getRtkStatus(opts?: { forceRecheck?: boolean }): Promise<{ installed: boolean; path: string | null; version: string | null }>
   getRtkGain(): Promise<{ totalCommands: number; totalInput: number; totalOutput: number; totalSaved: number; avgSavingsPct: number; totalTimeMs: number; avgTimeMs: number } | null>
+
+  // Decision model (Jev / TypeSafe System One) — opt-in decision layer
+  getDecisionLayerSettings(): Promise<DecisionLayerSettings>
+  setDecisionLayerSettings(patch: DecisionLayerSettingsPatch): Promise<DecisionLayerSettings>
+  getDecisionLayerStatus(): Promise<DecisionLayerStatus>
+  setDecisionApiKey(provider: DecisionProviderId, apiKey: string): Promise<void>
+  deleteDecisionApiKey(provider: DecisionProviderId): Promise<boolean>
+  testDecisionConnection(options?: { settings?: DecisionLayerSettingsPatch; apiKey?: string }): Promise<DecisionTestResult>
+  /** GET {baseUrl}/health of the configured local decision server (Laya / custom). Never rejects for network errors. */
+  probeDecisionServer(options?: { baseUrl?: string }): Promise<DecisionServerProbe>
 
   // Network proxy settings
   getNetworkProxySettings(): Promise<NetworkProxySettings | undefined>

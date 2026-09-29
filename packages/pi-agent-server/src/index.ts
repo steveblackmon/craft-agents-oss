@@ -33,6 +33,7 @@ import {
   createGrepToolDefinition,
   createFindToolDefinition,
   createLsToolDefinition,
+  getAgentDir,
 } from '@earendil-works/pi-coding-agent';
 import type {
   AgentSession,
@@ -64,8 +65,20 @@ import { registerBunOAuthFlows } from '@earendil-works/pi-ai/bun-oauth';
 registerBunOAuthFlows();
 
 // Model resolution (extracted for testability + custom-endpoint precedence)
-import { resolvePiModel, isDeniedMiniModelId, isModelNotFoundError } from './model-resolution.ts';
+import { resolvePiModel, isDeniedMiniModelId } from './model-resolution.ts';
 import { pickProviderAppropriateMiniModel } from './pick-mini-model.ts';
+import { queryMiniModel } from './mini-model-query.ts';
+import {
+  CRAFT_PI_EPHEMERAL_QUERY_DEADLINE_MS,
+  createCraftSettingsManager,
+} from './session-settings.ts';
+import {
+  EphemeralQueryCancelledError,
+  EphemeralQueryCoordinator,
+  isEphemeralQueryCancellation,
+  type EphemeralQueryContext,
+  type EphemeralQueryResource,
+} from './ephemeral-query-lifecycle.ts';
 import {
   buildCustomEndpointModelDef,
   normalizeCustomEndpointModelEntry,
@@ -78,7 +91,7 @@ import {
 // Direct source imports from shared (bundled by bun build)
 import { handleLargeResponse, estimateTokens, tokenLimitFor } from '../../shared/src/utils/large-response.ts';
 import { getSessionPlansPath, getSessionPath } from '../../shared/src/sessions/storage.ts';
-import { buildCallLlmRequest, withTimeout, LLM_QUERY_TIMEOUT_MS } from '../../shared/src/agent/llm-tool.ts';
+import { buildCallLlmRequest } from '../../shared/src/agent/llm-tool.ts';
 import type { LLMQueryRequest, LLMQueryResult } from '../../shared/src/agent/llm-tool.ts';
 import { PI_TOOL_NAME_MAP, THINKING_TO_PI } from '../../shared/src/agent/backend/pi/constants.ts';
 import { getDefaultSummarizationModel } from '../../shared/src/config/models.ts';
@@ -86,7 +99,14 @@ import { createWebFetchTool } from './tools/web-fetch.ts';
 import { resolveSearchProvider } from './tools/search/resolve-provider.ts';
 import { createSearchTool } from './tools/search/create-search-tool.ts';
 import { allowCraftMetadataProperties, stripCraftMetadata } from './craft-metadata-schema.ts';
-import { applySystemPromptOverride } from './system-prompt-override.ts';
+import {
+  createCraftResourceLoader,
+  createSystemPromptOverride,
+  type SystemPromptOverride,
+} from './system-prompt-override.ts';
+import { readContextUsage, deferContextUsage } from './context-usage.ts';
+import { waitForCompaction, MANUAL_COMPACT_WAIT_MS, PROMPT_COMPACT_WAIT_MS } from './compaction-wait.ts';
+import type { PiCompactResult, PiContextUsagePayload } from '../../shared/src/agent/backend/pi/protocol.ts';
 import { adaptCredentialForPiSdk, type PiCredential } from './adapt-credential.ts';
 
 // ============================================================
@@ -140,6 +160,7 @@ type InboundMessage =
   | { type: 'abort' }
   | { type: 'mini_completion'; id: string; prompt: string }
   | { type: 'llm_query'; id: string; request: LLMQueryRequest }
+  | { type: 'cancel_ephemeral_query'; id: string }
   | { type: 'ensure_session_ready'; id: string }
   | { type: 'set_model'; model: string }
   | { type: 'set_thinking_level'; level: string }
@@ -168,7 +189,7 @@ type EnrichedToolExecutionStartEvent = Extract<AgentSessionEvent, { type: 'tool_
   toolMetadata?: ToolExecutionMetadata;
 };
 
-type OutboundAgentEvent = AgentSessionEvent | EnrichedToolExecutionStartEvent;
+type OutboundAgentEvent = (AgentSessionEvent | EnrichedToolExecutionStartEvent | { type: 'context_usage' }) & PiContextUsagePayload;
 
 /** Messages to main process (stdout) */
 interface OutboundReady { type: 'ready'; sessionId: string | null; callbackPort: number }
@@ -199,7 +220,7 @@ interface OutboundCompactResult {
   type: 'compact_result';
   id: string;
   success: boolean;
-  result?: { summary: string; firstKeptEntryId: string; tokensBefore: number };
+  result?: PiCompactResult;
   errorMessage?: string;
 }
 interface OutboundSetAutoCompactionResult {
@@ -217,7 +238,7 @@ interface OutboundRuntimeConfigUpdateResult {
   errorMessage?: string;
 }
 interface OutboundSessionIdUpdate { type: 'session_id_update'; sessionId: string }
-interface OutboundError { type: 'error'; message: string; code?: string }
+interface OutboundError { type: 'error'; message: string; code?: string; id?: string }
 
 type OutboundMessage =
   | OutboundReady
@@ -239,6 +260,11 @@ type OutboundMessage =
 // ============================================================
 
 let piSession: AgentSession | null = null;
+// Forces Craft's system prompt onto piSession (see system-prompt-override.ts);
+// recreated together with the session.
+let piSessionPromptOverride: SystemPromptOverride | null = null;
+// A stop must also cancel a manual compact still waiting for auto-compaction.
+let compactionEpoch = 0;
 let piModelRegistry: PiModelRegistry | null = null;
 let moduleCredentialStore: InMemoryCredentialStore | null = null;
 // Cached runtime build shared by the main session and ephemeral queryLlm
@@ -249,6 +275,14 @@ let moduleRuntimePromise: Promise<{
   modelRegistry: PiModelRegistry;
 }> | null = null;
 let unsubscribeEvents: (() => void) | null = null;
+
+const ephemeralQueries = new EphemeralQueryCoordinator();
+let localEphemeralQueryCounter = 0;
+
+function nextLocalEphemeralQueryId(source: string): string {
+  localEphemeralQueryCounter += 1;
+  return `${source}-${localEphemeralQueryCounter}`;
+}
 
 // Init config (set on 'init' message)
 let initConfig: Extract<InboundMessage, { type: 'init' }> | null = null;
@@ -618,12 +652,17 @@ async function ensureSession(): Promise<AgentSession> {
   const toolAllowlist = wrappedAll.map(t => t.name);
   debugLog(`Session tools: ${builtinDefs.length} builtin + ${webTools.length} web + ${proxyTools.length} proxy = ${wrappedAll.length} total`);
 
-  // Build session options
+  // Build session options.
+  // settingsManager: explicit in-memory settings (retry policy, compaction)
+  // instead of the SDK default that merges `<cwd>/.pi/settings.json` from the
+  // user's working directory and writes to `<agentDir>/settings.json`.
+  const settingsManager = createCraftSettingsManager('main');
   const sessionOptions: CreateAgentSessionOptions = {
     cwd,
     modelRuntime,
     customTools: wrappedAll,
     tools: toolAllowlist,
+    settingsManager,
   };
 
   // Extension isolation: set agentDir to a temp directory under session path
@@ -707,9 +746,21 @@ async function ensureSession(): Promise<AgentSession> {
     sessionOptions.thinkingLevel = piThinkingLevel;
   }
 
+  // Craft's system prompt is forced through a before_agent_start extension
+  // registered on the resource loader (see system-prompt-override.ts). The
+  // loader otherwise mirrors the one createAgentSession would build itself.
+  const systemPromptOverride = createSystemPromptOverride();
+  sessionOptions.resourceLoader = await createCraftResourceLoader({
+    cwd,
+    agentDir: sessionOptions.agentDir ?? getAgentDir(),
+    settingsManager,
+    systemPromptOverride,
+  });
+
   // Create the session — tools flow through customTools + allowlist (see comment above).
   const { session } = await createAgentSession(sessionOptions);
   piSession = session;
+  piSessionPromptOverride = systemPromptOverride;
 
   toolsChanged = false;
   debugLog(`Created Pi session: ${session.sessionId} (${wrappedAll.length} tools)`);
@@ -930,7 +981,11 @@ function buildProxyTools(): ToolDefinition<any, any>[] {
 // LLM Query (ephemeral session for call_llm + mini completions)
 // ============================================================
 
-async function queryLlm(request: LLMQueryRequest): Promise<LLMQueryResult> {
+async function queryLlm(
+  request: LLMQueryRequest,
+  lifecycle: EphemeralQueryContext,
+): Promise<LLMQueryResult> {
+  lifecycle.throwIfCancelled();
   if (!initConfig) throw new Error('Cannot run queryLlm: init not received');
 
   debugLog('[queryLlm] Starting');
@@ -943,6 +998,7 @@ async function queryLlm(request: LLMQueryRequest): Promise<LLMQueryResult> {
 
   // Create authenticated runtime upfront — used by both the provider guard and the ephemeral session.
   const { modelRuntime, modelRegistry } = await createAuthenticatedRuntime();
+  lifecycle.throwIfCancelled();
 
   const piAuthProvider = initConfig.piAuth?.provider;
 
@@ -970,6 +1026,7 @@ async function queryLlm(request: LLMQueryRequest): Promise<LLMQueryResult> {
   }
 
   const runQueryWithModel = async (modelId: string): Promise<string> => {
+    lifecycle.throwIfCancelled();
     debugLog(`[queryLlm] Using model: ${modelId}`);
 
     // Resolve model — fail fast if unresolvable so we don't let the Pi SDK
@@ -983,44 +1040,61 @@ async function queryLlm(request: LLMQueryRequest): Promise<LLMQueryResult> {
       );
     }
 
-    // Create minimal ephemeral session
+    // Create minimal ephemeral session. The resource loader mirrors the SDK
+    // default (same cwd, default agentDir) plus the system-prompt override.
+    const ephemeralSettings = createCraftSettingsManager('ephemeral');
+    const ephemeralPromptOverride = createSystemPromptOverride();
     const ephemeralOptions: CreateAgentSessionOptions = {
       cwd: resolvedCwd(),
       modelRuntime,
       tools: [],
       sessionManager: PiSessionManager.inMemory(),
+      settingsManager: ephemeralSettings,
       model: piModel,
+      resourceLoader: await createCraftResourceLoader({
+        cwd: resolvedCwd(),
+        agentDir: getAgentDir(),
+        settingsManager: ephemeralSettings,
+        systemPromptOverride: ephemeralPromptOverride,
+      }),
     };
 
     const { session: ephemeralSession } = await createAgentSession(ephemeralOptions);
+    const resource: EphemeralQueryResource = {
+      abort: () => ephemeralSession.abort(),
+      dispose: () => ephemeralSession.dispose(),
+    };
+    lifecycle.setResource(resource);
 
-    // Pi SDK ignores options.model for ephemeral sessions (same issue as options.tools).
-    // Explicitly set the model after creation to ensure the mini model is used.
+    let unsub: (() => void) | undefined;
     try {
-      await ephemeralSession.setModel(piModel);
-    } catch {
-      debugLog(`[queryLlm] Failed to set model on ephemeral session, proceeding with default`);
-    }
+      // Pi SDK ignores options.model for ephemeral sessions (same issue as options.tools).
+      // Explicitly set the model after creation to ensure the mini model is used.
+      try {
+        await ephemeralSession.setModel(piModel);
+      } catch {
+        debugLog(`[queryLlm] Failed to set model on ephemeral session, proceeding with default`);
+      }
+      lifecycle.throwIfCancelled();
 
-    debugLog(`[queryLlm] Created ephemeral session: ${ephemeralSession.sessionId}`);
+      debugLog(`[queryLlm] Created ephemeral session: ${ephemeralSession.sessionId}`);
 
-    // Force the system prompt — see system-prompt-override.ts for why direct
-    // assignment to `state.systemPrompt` doesn't survive `session.prompt()`.
-    const promptForSession =
-      request.systemPrompt ?? 'Reply with ONLY the requested text. No explanation.';
-    applySystemPromptOverride(ephemeralSession, promptForSession);
+      // Force the system prompt via the before_agent_start override registered
+      // on this session's resource loader (see system-prompt-override.ts).
+      const promptForSession =
+        request.systemPrompt ?? 'Reply with ONLY the requested text. No explanation.';
+      ephemeralPromptOverride.set(promptForSession);
 
-    // Collect response text and errors from events
-    let result = '';
-    let lastError = '';
-    let completionResolve: () => void;
-    const completionPromise = new Promise<void>((resolve) => {
-      completionResolve = resolve;
-    });
+      // Collect response text and errors from events. `prompt()` resolves only
+      // after SDK retries/continuations settle, so the request-level coordinator
+      // owns the one actual deadline around this call.
+      let result = '';
+      let lastError = '';
 
-    const unsub = ephemeralSession.subscribe((event: AgentSessionEvent) => {
-      if (event.type === 'message_end') {
-        // Only capture assistant messages — Pi SDK emits message_end for user messages too
+      unsub = ephemeralSession.subscribe((event: AgentSessionEvent) => {
+        if (event.type !== 'message_end') return;
+
+        // Only capture assistant messages — Pi SDK emits message_end for user messages too.
         const msg = event.message as {
           role?: string;
           content?: string | Array<{ type: string; text?: string }>;
@@ -1029,7 +1103,7 @@ async function queryLlm(request: LLMQueryRequest): Promise<LLMQueryResult> {
         };
         if (msg.role !== 'assistant') return;
 
-        // Capture API errors from message_end (e.g. auth failures, model errors)
+        // Capture API errors from message_end (e.g. auth failures, model errors).
         if (msg.stopReason === 'error' && msg.errorMessage) {
           lastError = msg.errorMessage;
           debugLog(`[queryLlm] API error in message_end: ${msg.errorMessage}`);
@@ -1043,82 +1117,48 @@ async function queryLlm(request: LLMQueryRequest): Promise<LLMQueryResult> {
             .map((c) => c.text!)
             .join('');
         }
-      }
-      if (event.type === 'agent_end') {
-        completionResolve();
-      }
-    });
+      });
 
-    try {
+      lifecycle.throwIfCancelled();
       await ephemeralSession.prompt(request.prompt);
-      await withTimeout(
-        completionPromise,
-        LLM_QUERY_TIMEOUT_MS,
-        `queryLlm timed out after ${LLM_QUERY_TIMEOUT_MS / 1000}s`
-      );
+      lifecycle.throwIfCancelled();
       debugLog(`[queryLlm] Result length: ${result.trim().length}`);
 
-      // If we got no text but captured an error, throw so callers see the real issue
+      // If we got no text but captured an error, throw so callers see the real issue.
       if (!result.trim() && lastError) {
         throw new Error(lastError);
       }
 
       return result.trim();
     } finally {
-      unsub();
+      unsub?.();
+      lifecycle.clearResource(resource);
       ephemeralSession.dispose();
     }
   };
 
-  const fallbackCandidates = [
-    // Removed 'pi/gpt-5.1-codex-mini' (#596) — stale on several OpenAI catalogs.
-    // The connection-configured miniModel is still tried via `initConfig.miniModel`.
-    'pi/gpt-5-mini',
-    initConfig.miniModel,
-    getDefaultSummarizationModel(),
-  ].filter((candidate): candidate is string => !!candidate && !isDeniedMiniModelId(candidate, piAuthProvider));
+  return queryMiniModel({
+    model,
+    miniModel: initConfig.miniModel,
+    sessionModel: initConfig.model,
+    authProvider: piAuthProvider,
+    modelRegistry,
+    preferCustomEndpoint: shouldPreferCustomEndpoint(),
+    onFallback: (rejectedModel, retryModel) => {
+      debugLog(`[queryLlm] Model ${rejectedModel} unavailable, retrying with ${retryModel}`);
+    },
+  }, runQueryWithModel);
+}
 
-  const triedModels = new Set<string>();
-  let currentModel = model;
-
-  while (true) {
-    triedModels.add(currentModel);
-    try {
-      const text = await runQueryWithModel(currentModel);
-      return { text, model: currentModel };
-    } catch (error) {
-      const errorMsg = error instanceof Error ? error.message : String(error);
-      const shouldRetry = isModelNotFoundError(errorMsg);
-
-      if (!shouldRetry) {
-        throw error;
-      }
-
-      const retryModel = fallbackCandidates.find(candidate => {
-        if (triedModels.has(candidate)) return false;
-        try {
-          const resolved = resolvePiModel(modelRegistry, candidate, initConfig!.piAuth?.provider, shouldPreferCustomEndpoint());
-          if (!resolved) return false;
-          if (initConfig!.piAuth) {
-            const rp = (resolved as any).provider;
-            if (rp !== initConfig!.piAuth.provider && rp !== 'custom-endpoint') {
-              return false;
-            }
-          }
-          return true;
-        } catch {
-          return false;
-        }
-      });
-
-      if (!retryModel) {
-        throw error;
-      }
-
-      debugLog(`[queryLlm] Model ${currentModel} not found, retrying with ${retryModel}`);
-      currentModel = retryModel;
-    }
-  }
+function runEphemeralLlmQuery(
+  id: string,
+  request: LLMQueryRequest,
+): Promise<LLMQueryResult> {
+  return ephemeralQueries.run(
+    id,
+    CRAFT_PI_EPHEMERAL_QUERY_DEADLINE_MS,
+    lifecycle => queryLlm(request, lifecycle),
+  );
 }
 
 async function preExecuteCallLlm(input: Record<string, unknown>): Promise<LLMQueryResult> {
@@ -1126,12 +1166,15 @@ async function preExecuteCallLlm(input: Record<string, unknown>): Promise<LLMQue
     ? getSessionPath(initConfig.workspaceRootPath, initConfig.sessionId)
     : undefined;
   const request = await buildCallLlmRequest(input, { backendName: 'Pi', sessionPath });
-  return queryLlm(request);
+  return runEphemeralLlmQuery(nextLocalEphemeralQueryId('callback'), request);
 }
 
 async function runMiniCompletion(prompt: string): Promise<string | null> {
   try {
-    const result = await queryLlm({ prompt });
+    const result = await runEphemeralLlmQuery(
+      nextLocalEphemeralQueryId('summary'),
+      { prompt },
+    );
     const text = result.text || null;
     debugLog(`[runMiniCompletion] Result: ${text ? `"${text.slice(0, 200)}"` : 'null'}`);
     return text;
@@ -1171,6 +1214,11 @@ function handleSessionEvent(event: AgentSessionEvent): void {
     }
 
     if (msg?.role === 'assistant' && piSession) {
+      // The SDK's post-compaction usage gate reads the journal, which is only
+      // appended after this callback returns. Defer rather than report an old count.
+      deferContextUsage(piSession, () => piSession, (payload) => {
+        send({ type: 'event', event: { type: 'context_usage', ...payload } });
+      });
       // CRITICAL: do NOT read `getLeafId()` here.
       //
       // The Pi SDK fires `message_end` synchronously BEFORE calling
@@ -1276,6 +1324,12 @@ function handleSessionEvent(event: AgentSessionEvent): void {
     }
   }
 
+  // These boundaries already have committed SDK history; keep metadata inline
+  // so agent_end cannot close the host queue before occupancy reaches it.
+  if (piSession && (event.type === 'turn_end' || event.type === 'agent_end' || event.type === 'compaction_end')) {
+    forwardedEvent = { ...forwardedEvent, ...readContextUsage(piSession) };
+  }
+
   // Forward all events to main process
   send({ type: 'event', event: forwardedEvent });
 }
@@ -1285,6 +1339,9 @@ function handleSessionEvent(event: AgentSessionEvent): void {
 // ============================================================
 
 async function handleInit(msg: Extract<InboundMessage, { type: 'init' }>): Promise<void> {
+  // A re-init invalidates every utility query created under the old credentials.
+  ephemeralQueries.cancelAll(new EphemeralQueryCancelledError('Pi server reinitialized'));
+
   // Clean up any existing session from a previous init
   if (piSession) {
     if (unsubscribeEvents) {
@@ -1322,30 +1379,6 @@ async function handleInit(msg: Extract<InboundMessage, { type: 'init' }>): Promi
   });
 }
 
-/**
- * Wait for any in-flight compaction to finish before sending a prompt or
- * starting another compaction. Prevents a race in the Pi SDK where concurrent
- * _runAutoCompaction calls crash on a shared AbortController
- * (see craft-agents-oss#464). Default timeout matches the RPC compact timeout
- * in PiAgent.requestCompact (300 s), since GPT compactions can legitimately
- * take 60–120 s.
- */
-async function waitForCompaction(session: { isCompacting: boolean }, timeoutMs = 300_000): Promise<void> {
-  if (!session.isCompacting) return;
-  debugLog('Waiting for in-flight compaction to finish before prompt...');
-  const start = Date.now();
-  while (session.isCompacting) {
-    if (Date.now() - start > timeoutMs) {
-      debugLog(`Compaction wait timed out after ${Math.floor(timeoutMs / 1000)}s, proceeding anyway`);
-      break;
-    }
-    await new Promise(resolve => setTimeout(resolve, 200));
-  }
-  if (Date.now() - start < timeoutMs) {
-    debugLog('Compaction finished, proceeding with prompt');
-  }
-}
-
 async function handlePrompt(msg: Extract<InboundMessage, { type: 'prompt' }>): Promise<void> {
   currentUserMessage = msg.message;
 
@@ -1365,11 +1398,10 @@ async function handlePrompt(msg: Extract<InboundMessage, { type: 'prompt' }>): P
 
     const session = await ensureSession();
 
-    // Force the Craft-built system prompt onto the Pi session. Direct assignment
-    // to `state.systemPrompt` is wiped on every `session.prompt()` call by the Pi
-    // SDK (see system-prompt-override.ts).
+    // Force the Craft-built system prompt onto the Pi session through the
+    // before_agent_start override created with it (see system-prompt-override.ts).
     if (msg.systemPrompt) {
-      applySystemPromptOverride(session, msg.systemPrompt);
+      piSessionPromptOverride?.set(msg.systemPrompt);
     }
 
     // Wire up event handler
@@ -1379,7 +1411,10 @@ async function handlePrompt(msg: Extract<InboundMessage, { type: 'prompt' }>): P
     unsubscribeEvents = session.subscribe(handleSessionEvent);
 
     // Wait for any in-flight auto-compaction to avoid race (craft-agents-oss#464)
-    await waitForCompaction(session);
+    const compactionWait = await waitForCompaction(session, { timeoutMs: PROMPT_COMPACT_WAIT_MS, log: debugLog });
+    if (compactionWait.timedOut) {
+      debugLog('Proceeding with prompt while the compaction flag is still set');
+    }
 
     // Fire prompt — use followUp when session is already streaming so the
     // message is queued instead of throwing "Agent is already processing".
@@ -1444,7 +1479,18 @@ function handlePreToolUseResponse(msg: Extract<InboundMessage, { type: 'pre_tool
   }
 }
 
+function handleCancelEphemeralQuery(
+  msg: Extract<InboundMessage, { type: 'cancel_ephemeral_query' }>,
+): void {
+  const cancelled = ephemeralQueries.cancel(
+    msg.id,
+    new EphemeralQueryCancelledError(`Ephemeral query cancelled by host: ${msg.id}`),
+  );
+  debugLog(`${cancelled ? 'Cancelled' : 'No active'} ephemeral query: ${msg.id}`);
+}
+
 async function handleAbort(): Promise<void> {
+  compactionEpoch++;
   if (piSession) {
     try {
       await piSession.abort();
@@ -1468,12 +1514,17 @@ async function handleMiniCompletion(msg: Extract<InboundMessage, { type: 'mini_c
   // as 'error' messages instead of being swallowed and returned as null.
   // runMiniCompletion is kept for the summarize callback where null is acceptable.
   try {
-    const result = await queryLlm({ prompt: msg.prompt });
+    const result = await runEphemeralLlmQuery(msg.id, { prompt: msg.prompt });
     send({ type: 'mini_completion_result', id: msg.id, text: result.text || null });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     debugLog(`[handleMiniCompletion] Error: ${errorMsg}`);
-    send({ type: 'error', message: errorMsg, code: 'mini_completion_error' });
+    if (isEphemeralQueryCancellation(error)) {
+      // Mini completions are best-effort; preserve their null-on-timeout contract.
+      send({ type: 'mini_completion_result', id: msg.id, text: null });
+    } else {
+      send({ type: 'error', id: msg.id, message: errorMsg, code: 'mini_completion_error' });
+    }
   }
 }
 
@@ -1483,15 +1534,15 @@ async function handleMiniCompletion(msg: Extract<InboundMessage, { type: 'mini_c
 // request-propagation + request-honoring are independent (see #596).
 async function handleLlmQuery(msg: Extract<InboundMessage, { type: 'llm_query' }>): Promise<void> {
   try {
-    const result = await queryLlm(msg.request);
+    const result = await runEphemeralLlmQuery(msg.id, msg.request);
     send({ type: 'llm_query_result', id: msg.id, result });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
     debugLog(`[handleLlmQuery] Error: ${errorMsg}`);
     // Dual-emit: the generic `error` channel drives main-process OAuth
     // auth-refresh detection (centralized in PiAgent), while the targeted
-    // `llm_query_result` rejects the pending promise for this specific call.
-    send({ type: 'error', message: errorMsg, code: 'llm_query_error' });
+    // `llm_query_result` rejects only this pending call.
+    send({ type: 'error', id: msg.id, message: errorMsg, code: 'llm_query_error' });
     send({ type: 'llm_query_result', id: msg.id, result: null, errorMessage: errorMsg, errorCode: 'llm_query_error' });
   }
 }
@@ -1506,16 +1557,27 @@ async function handleEnsureSessionReady(msg: Extract<InboundMessage, { type: 'en
 }
 
 async function handleCompact(msg: Extract<InboundMessage, { type: 'compact' }>): Promise<void> {
+  const epoch = compactionEpoch;
+  const startedAt = Date.now();
   try {
     const session = await ensureSession();
-    // Serialize manual /compact behind any in-flight auto-compaction. Public
+    // Serialize manual /compact behind an in-flight auto-compaction. Public
     // session.compact() calls agent.abort() and uses its own controller; if
     // it runs while _runAutoCompaction is suspended, agent state churns and
-    // the SDK's race surface widens. Wait for the auto-compaction to drain
-    // before starting a manual one. waitForCompaction has its own timeout
-    // fallback so we don't deadlock on a stuck subprocess.
-    await waitForCompaction(session);
+    // the SDK's race surface widens. The wait is capped well under the host's
+    // 300 s RPC deadline: a stuck compaction used to eat the whole budget
+    // before compact() even started (craft-agents-oss#1060). Proceeding after
+    // the cap is deliberate, since compact() begins with abort() and thereby
+    // cancels the stale compaction.
+    const wait = await waitForCompaction(session, { timeoutMs: MANUAL_COMPACT_WAIT_MS, log: debugLog });
+    if (piSession !== session || epoch !== compactionEpoch) throw new Error('Compaction aborted or session replaced');
+    debugLog(
+      `[compact] Starting manual compaction after ${wait.waitedMs}ms wait` +
+        (wait.timedOut ? ' (prior compaction still flagged; compact() aborts it)' : ''),
+    );
     const result = await session.compact(msg.customInstructions);
+    if (piSession !== session || epoch !== compactionEpoch) throw new Error('Compaction aborted or session replaced');
+    debugLog(`[compact] Done in ${Date.now() - startedAt}ms: ${result.tokensBefore} -> ~${result.estimatedTokensAfter} tokens`);
     send({
       type: 'compact_result',
       id: msg.id,
@@ -1524,11 +1586,13 @@ async function handleCompact(msg: Extract<InboundMessage, { type: 'compact' }>):
         summary: result.summary,
         firstKeptEntryId: result.firstKeptEntryId,
         tokensBefore: result.tokensBefore,
+        estimatedTokensAfter: result.estimatedTokensAfter,
+        ...readContextUsage(session),
       },
     });
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : String(error);
-    debugLog(`[compact] Failed: ${errorMsg}`);
+    debugLog(`[compact] Failed after ${Date.now() - startedAt}ms: ${errorMsg}`);
     send({
       type: 'compact_result',
       id: msg.id,
@@ -1678,6 +1742,9 @@ async function handleSetThinkingLevel(msg: Extract<InboundMessage, { type: 'set_
 function handleShutdown(): void {
   debugLog('Shutdown requested');
 
+  // Abort utility sessions independently from the main chat session.
+  ephemeralQueries.cancelAll(new EphemeralQueryCancelledError('Pi server shutting down'));
+
   // Unsubscribe events
   if (unsubscribeEvents) {
     unsubscribeEvents();
@@ -1743,6 +1810,10 @@ async function processMessage(msg: InboundMessage): Promise<void> {
 
     case 'llm_query':
       await handleLlmQuery(msg);
+      break;
+
+    case 'cancel_ephemeral_query':
+      handleCancelEphemeralQuery(msg);
       break;
 
     case 'ensure_session_ready':

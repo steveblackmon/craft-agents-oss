@@ -334,6 +334,15 @@ export type SdkMcpServerConfig =
  * 3. Support streaming via AsyncGenerator
  * 4. Allow capability-based UI adaptation
  */
+/** Identity is optional for callers using the legacy text-only redirect path. */
+export interface RedirectMetadata {
+  messageId?: string;
+}
+
+export interface PendingSteer extends RedirectMetadata {
+  message: string;
+}
+
 export interface AgentBackend {
   // ============================================================
   // Chat & Lifecycle
@@ -402,7 +411,19 @@ export interface AgentBackend {
    * @returns true if steered (events flow through existing stream),
    *          false if aborted (session layer must queue + re-send)
    */
-  redirect(message: string): boolean;
+  redirect(message: string, metadata?: RedirectMetadata): boolean;
+
+  /**
+   * Whether a manual context compaction owns the current turn.
+   *
+   * While true there is no agent loop consuming steers, so a mid-stream text
+   * message must be queued for replay after `complete` instead of handed to
+   * redirect() (OSS #1058). Optional: backends without the concept report false.
+   */
+  isCompactionInFlight?(): boolean;
+
+  /** Transfer undelivered text steers to the host before handoff/teardown. */
+  takePendingSteers?(): PendingSteer[];
 
   /**
    * Run a simple text completion using the backend's auth infrastructure.
