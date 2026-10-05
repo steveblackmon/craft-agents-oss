@@ -77,6 +77,7 @@ import {
 import { sessionMetaMapAtom, updateSessionMetaAtom, type SessionMeta } from '@/atoms/sessions'
 import { sourcesAtom } from '@/atoms/sources'
 import { skillsAtom } from '@/atoms/skills'
+import { guardedModeAvailableAtom } from '@/atoms/permission-modes'
 import {
   panelStackAtom,
   pushPanelAtom,
@@ -832,6 +833,10 @@ export function NavigationProvider({
             const parsedMode = parsePermissionMode(parsed.params.mode)
             if (!parsedMode) {
               console.warn('[Navigation] Invalid permission mode:', parsed.params.mode)
+              break
+            }
+            if (parsedMode === 'guarded' && !store.get(guardedModeAvailableAtom)) {
+              console.warn('[Navigation] Guarded mode is not available (turn it on under Settings → AI → Decision model)')
               break
             }
             await window.electronAPI.sessionCommand(

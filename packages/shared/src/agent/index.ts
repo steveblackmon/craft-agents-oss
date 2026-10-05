@@ -44,11 +44,20 @@ export {
   cyclePermissionMode,
   subscribeModeChanges,
   PERMISSION_MODE_ORDER,
+  DEFAULT_PERMISSION_MODES,
   PERMISSION_MODE_CONFIG,
+  availablePermissionModes,
+  planExecutionMode,
+  parsePermissionMode,
+  isAutonomousPermissionMode,
+  isPermissionMode,
+  clampPermissionMode,
   type PermissionMode,
   getModeState,
   hydratePreviousPermissionMode,
   getPermissionModeDiagnostics,
+  resolveEffectivePermissionMode,
+  setGuardedModeActiveResolver,
   initializeModeState,
   cleanupModeState,
   // Tool blocking (centralized)
@@ -170,3 +179,6 @@ export {
   createPushableInputStream,
   type PushableInputStream,
 } from './backend/claude/persistent-input.ts';
+
+// Guarded-mode risk check seam (the host implements the check; see core/guarded-mode.ts)
+export type { GuardedModeCheck, GuardedModeCall, GuardedModeRisk, GuardedModeVerdict } from './core/guarded-mode.ts';

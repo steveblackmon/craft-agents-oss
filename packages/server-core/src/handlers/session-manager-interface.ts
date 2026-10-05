@@ -310,6 +310,12 @@ export interface ExecutePromptAutomationInput {
   /** Override the workspace default thinking level for the spawned session. */
   thinkingLevel?: ThinkingLevel
   automationName?: string
+  /** Matcher id of the automation (stored on the session for the loop guard). */
+  automationId?: string
+  /** Event that fired the automation. */
+  triggerEvent?: string
+  /** Chain depth of the new session (see `automationLoopGuard`); 1 when omitted. */
+  chainDepth?: number
   /**
    * Optional Telegram forum-topic name. When set and the workspace has a
    * paired supergroup, the new session is bound to a topic of this name

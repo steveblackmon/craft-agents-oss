@@ -2,9 +2,10 @@ import * as React from 'react'
 import { useTranslation } from "react-i18next"
 import { cn } from '@/lib/utils'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
-import { SlashCommandMenu, DEFAULT_SLASH_COMMAND_GROUPS, type SlashCommandId } from '@/components/ui/slash-command-menu'
+import { SlashCommandMenu, permissionModeCommandsFor, type SlashCommandId } from '@/components/ui/slash-command-menu'
+import { useAvailablePermissionModes } from '@/hooks/useAvailablePermissionModes'
 import { ChevronDown, Info } from 'lucide-react'
-import { PERMISSION_MODE_CONFIG, type PermissionMode } from '@craft-agent/shared/agent/modes'
+import { PERMISSION_MODE_CONFIG, isPermissionMode, type PermissionMode } from '@craft-agent/shared/agent/modes'
 import { ActiveTasksBar, type BackgroundTask } from './ActiveTasksBar'
 import type { TerminalOverlayData } from './TaskActionMenu'
 import { LabelIcon, LabelValueTypeIcon } from '@/components/ui/label-icon'
@@ -26,7 +27,7 @@ import { SessionInfoPopover } from './SessionInfoPopover'
 // ============================================================================
 
 function PermissionModeIcon({ mode, className }: { mode: PermissionMode; className?: string }) {
-  const config = PERMISSION_MODE_CONFIG[mode]
+  const config = PERMISSION_MODE_CONFIG[mode] ?? PERMISSION_MODE_CONFIG.ask
   return (
     <svg
       viewBox="0 0 24 24"
@@ -449,9 +450,13 @@ function PermissionModeDropdown({ permissionMode, onPermissionModeChange, sessio
     return [optimisticMode as SlashCommandId]
   }, [optimisticMode])
 
+  // Guarded is listed only while its decision-model feature is on (or it is the current mode)
+  const modes = useAvailablePermissionModes(optimisticMode)
+  const commandGroups = React.useMemo(() => [{ id: 'modes', commands: permissionModeCommandsFor(modes) }], [modes])
+
   // Handle command selection from dropdown
   const handleSelect = React.useCallback((commandId: SlashCommandId) => {
-    if (commandId === 'safe' || commandId === 'ask' || commandId === 'allow-all') {
+    if (isPermissionMode(commandId)) {
       setOptimisticMode(commandId)
       onPermissionModeChange?.(commandId)
     }
@@ -459,12 +464,13 @@ function PermissionModeDropdown({ permissionMode, onPermissionModeChange, sessio
   }, [onPermissionModeChange])
 
   // Get config for current mode (use optimistic state for instant UI update)
-  const config = PERMISSION_MODE_CONFIG[optimisticMode]
+  const config = PERMISSION_MODE_CONFIG[optimisticMode] ?? PERMISSION_MODE_CONFIG.ask
 
   // Mode-specific styling using CSS variables (theme-aware)
   // - safe (Explore): foreground at 60% opacity - subtle, read-only feel
   // - ask (Ask to Edit): info color - amber, prompts for edits
-  // - allow-all (Auto): accent color - purple, full autonomy
+  // - guarded (Guarded): success color - green, autonomy with the decision model's risk check
+  // - allow-all (Execute): accent color - purple, full autonomy
   const modeStyles: Record<PermissionMode, { className: string; shadowVar: string }> = {
     'safe': {
       className: 'bg-foreground/5 text-foreground/60',
@@ -474,12 +480,17 @@ function PermissionModeDropdown({ permissionMode, onPermissionModeChange, sessio
       className: 'bg-info/10 text-info',
       shadowVar: 'var(--info-rgb)',
     },
+    'guarded': {
+      className: 'bg-success/10 text-success',
+      shadowVar: 'var(--success-rgb)',
+    },
     'allow-all': {
       className: 'bg-accent/5 text-accent',
       shadowVar: 'var(--accent-rgb)',
     },
   }
-  const currentStyle = modeStyles[optimisticMode]
+  // A mode this build does not know (newer server) renders as Ask instead of crashing the input
+  const currentStyle = modeStyles[optimisticMode] ?? modeStyles.ask
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -515,7 +526,7 @@ function PermissionModeDropdown({ permissionMode, onPermissionModeChange, sessio
         }}
       >
         <SlashCommandMenu
-          commandGroups={DEFAULT_SLASH_COMMAND_GROUPS}
+          commandGroups={commandGroups}
           activeCommands={activeCommands}
           onSelect={handleSelect}
           showFilter

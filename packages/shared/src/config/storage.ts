@@ -21,7 +21,7 @@ import type { Plan } from '../agent/plan-types.ts';
 import type { PermissionMode } from '../agent/mode-manager.ts';
 import type { ThinkingLevel } from '../agent/thinking-levels.ts';
 import { isValidThinkingLevel, normalizeThinkingLevel } from '../agent/thinking-levels.ts';
-import { parsePermissionMode, PERMISSION_MODE_ORDER } from '../agent/mode-types.ts';
+import { parsePermissionMode, DEFAULT_PERMISSION_MODES } from '../agent/mode-types.ts';
 import { type ConfigDefaults } from './config-defaults-schema.ts';
 import { isValidThemeFile } from './validators.ts';
 import {
@@ -89,6 +89,7 @@ export interface StoredConfig {
   enable1MContext?: boolean;  // Enable 1M context window for supported models (default: false — opt-in; requires Anthropic Tier 4+)
   // Token optimization
   rtkEnabled?: boolean;  // Route Bash commands through rtk to compress tool output (default: false). https://github.com/rtk-ai/rtk
+  rtkExcludeCommands?: string[];  // Base commands never routed through rtk, e.g. ["grep", "cat"] (default: none)
   // Decision layer (Jev / TypeSafe System One) — opt-in, off by default. See src/decisions/.
   decisionLayer?: DecisionLayerStoredSettings;
   // Network proxy
@@ -203,7 +204,7 @@ export function loadConfigDefaults(): ConfigDefaults {
   }
 
   defaults.workspaceDefaults.cyclablePermissionModes =
-    normalizedCyclable.length >= 2 ? normalizedCyclable : [...PERMISSION_MODE_ORDER];
+    normalizedCyclable.length >= 2 ? normalizedCyclable : [...DEFAULT_PERMISSION_MODES];
 
   return defaults;
 }
@@ -583,6 +584,16 @@ export function setEnable1MContext(enabled: boolean): void {
 export function getRtkEnabled(): boolean {
   const config = loadStoredConfig();
   return config?.rtkEnabled === true;
+}
+
+/**
+ * Base commands (first word) that are never routed through rtk, from
+ * `rtkExcludeCommands` in config.json. Non-strings and blanks are ignored.
+ */
+export function getRtkExcludeCommands(): string[] {
+  const value = loadStoredConfig()?.rtkExcludeCommands;
+  if (!Array.isArray(value)) return [];
+  return value.filter((entry): entry is string => typeof entry === 'string' && entry.trim().length > 0).map(entry => entry.trim());
 }
 
 /**

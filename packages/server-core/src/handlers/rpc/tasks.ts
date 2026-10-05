@@ -45,6 +45,9 @@ import { createLogger } from '@craft-agent/shared/utils'
 import { pushTyped, type RpcServer } from '@craft-agent/server-core/transport'
 import type { HandlerDeps } from '../handler-deps'
 import { TaskRunner, createTaskFromSpec, finishTaskOrchestrator } from '../../tasks'
+import { buildTaskVerdictDecider } from '../../decisions/task-verdict'
+import { buildNodeOutcomeClassifier } from '../../decisions/turn-outcome'
+import { buildRepairScopePicker } from '../../decisions/task-repairs'
 
 const tasksLog = createLogger('tasks-generate')
 
@@ -104,7 +107,19 @@ export function registerTasksHandlers(server: RpcServer, deps: HandlerDeps): voi
     let runner = runners.get(workspaceId)
     if (!runner) {
       const ws = workspaceOrThrow(workspaceId)
-      runner = new TaskRunner({ host: deps.sessionManager, workspaceId: ws.id, workspaceRoot: ws.rootPath })
+      runner = new TaskRunner({
+        host: deps.sessionManager,
+        workspaceId: ws.id,
+        workspaceRoot: ws.rootPath,
+        // Decision model (Jev) reads verdicts out of replies without a VERDICT line; gated per call,
+        // `null` when the layer is off → the runner re-asks exactly as before.
+        decide: buildTaskVerdictDecider(),
+        // Decision model reads how a child's turn ended; a child that asked for input or gave up
+        // is failed (retry / needs-review) instead of marked done. `null` → marked done as before.
+        classifyNodeOutcome: buildNodeOutcomeClassifier(),
+        // Decision model narrows a FAIL without named subtasks to the ones its reason implicates.
+        pickRepairNodes: buildRepairScopePicker(),
+      })
       runners.set(workspaceId, runner)
     }
     return runner
@@ -391,6 +406,9 @@ export function registerTasksHandlers(server: RpcServer, deps: HandlerDeps): voi
           result: entry.result,
           ...(entry.reason ? { reason: entry.reason } : {}),
           ...(entry.nodes?.length ? { nodes: entry.nodes } : {}),
+          // Provenance: a decision-model verdict must stay distinguishable from a parsed VERDICT line.
+          ...(entry.via ? { via: entry.via } : {}),
+          ...(typeof entry.confidence === 'number' ? { confidence: entry.confidence } : {}),
         })
       } else if (entry.kind === 'run-completed') {
         runStatus = 'completed'

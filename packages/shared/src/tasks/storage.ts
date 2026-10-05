@@ -39,7 +39,17 @@ export type RunLogEntry =
   | { t: string; kind: 'node-finished'; nodeId: string; sessionId: string; state: NodeRunState; reason?: string }
   | { t: string; kind: 'node-retry'; nodeId: string; attempt: number; reason: string }
   | { t: string; kind: 'run-paused' | 'run-resumed' | 'run-stopped' | 'run-completed' | 'run-failed' | 'run-verifying' }
-  | { t: string; kind: 'verdict'; result: 'pass' | 'fail' | 'unparsed'; reason?: string; nodes?: string[] }
+  | {
+      t: string;
+      kind: 'verdict';
+      result: 'pass' | 'fail' | 'unparsed';
+      reason?: string;
+      nodes?: string[];
+      /** How the verdict was read: from the VERDICT line (default) or classified by the decision model. */
+      via?: 'parsed' | 'decision';
+      /** Decision-model classifications only: confidence of the winning option. */
+      confidence?: number;
+    }
   | { t: string; kind: 'budget-breach'; metric: 'tokens' | 'parallel' | 'iterations'; value: number; limit: number };
 
 // ---------------------------------------------------------------------------

@@ -71,6 +71,7 @@ export type { ExportResourcesOptions, ExportResult, ResourceImportMode, Resource
 import type { LlmConnection, LlmConnectionWithStatus, LlmAuthType, LlmProviderType, NetworkProxySettings } from '@craft-agent/shared/config';
 export type { LlmConnection, LlmConnectionWithStatus, LlmAuthType, LlmProviderType, NetworkProxySettings };
 import type {
+  DecisionLayerFeature,
   DecisionLayerSettings,
   DecisionLayerSettingsPatch,
   DecisionLayerStatus,
@@ -78,7 +79,7 @@ import type {
   DecisionServerProbe,
   DecisionTestResult,
 } from '@craft-agent/shared/decisions';
-export type { DecisionLayerSettings, DecisionLayerSettingsPatch, DecisionLayerStatus, DecisionProviderId, DecisionServerProbe, DecisionTestResult };
+export type { DecisionLayerFeature, DecisionLayerSettings, DecisionLayerSettingsPatch, DecisionLayerStatus, DecisionProviderId, DecisionServerProbe, DecisionTestResult };
 
 // =============================================================================
 // GUI-only types (not used by server/handler code)
@@ -592,7 +593,7 @@ export interface ElectronAPI {
   // RTK token optimization
   getRtkEnabled(): Promise<boolean>
   setRtkEnabled(enabled: boolean): Promise<void>
-  getRtkStatus(opts?: { forceRecheck?: boolean }): Promise<{ installed: boolean; path: string | null; version: string | null }>
+  getRtkStatus(opts?: { forceRecheck?: boolean }): Promise<{ installed: boolean; path: string | null; version: string | null; outdated: boolean; minSafeVersion: string; foundPath: string | null; updateCommand: string }>
   getRtkGain(): Promise<{ totalCommands: number; totalInput: number; totalOutput: number; totalSaved: number; avgSavingsPct: number; totalTimeMs: number; avgTimeMs: number } | null>
 
   // Decision model (Jev / TypeSafe System One) — opt-in decision layer
@@ -729,7 +730,7 @@ export interface ElectronAPI {
   setAutomationEnabled(workspaceId: string, eventName: string, matcherIndex: number, enabled: boolean): Promise<void>
   duplicateAutomation(workspaceId: string, eventName: string, matcherIndex: number): Promise<void>
   deleteAutomation(workspaceId: string, eventName: string, matcherIndex: number): Promise<void>
-  getAutomationHistory(workspaceId: string, automationId: string, limit?: number): Promise<Array<{ id: string; ts: number; ok: boolean; sessionId?: string; prompt?: string; error?: string; webhook?: { method: string; url: string; statusCode: number; durationMs: number; attempts?: number; error?: string; responseBody?: string } }>>
+  getAutomationHistory(workspaceId: string, automationId: string, limit?: number): Promise<Array<{ id: string; ts: number; ok: boolean; sessionId?: string; prompt?: string; error?: string; skipped?: string; webhook?: { method: string; url: string; statusCode: number; durationMs: number; attempts?: number; error?: string; responseBody?: string } }>>
   getAutomationLastExecuted(workspaceId: string): Promise<Record<string, number>>
   replayAutomation(workspaceId: string, automationId: string, eventName: string): Promise<{ results: Array<{ type: string; url: string; statusCode: number; success: boolean; error?: string; duration: number }> }>
 

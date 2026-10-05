@@ -759,6 +759,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
                 thinkingLevel={sessionOpts.thinkingLevel}
                 onThinkingLevelChange={(level) => setOption('thinkingLevel', level)}
                 permissionMode={sessionOpts.permissionMode}
+                previousPermissionMode={sessionOpts.previousPermissionMode}
                 onPermissionModeChange={setPermissionMode}
                 enabledModes={enabledModes}
                 inputValue={inputValue}
@@ -836,6 +837,7 @@ const ChatPage = React.memo(function ChatPage({ sessionId }: ChatPageProps) {
             thinkingLevel={sessionOpts.thinkingLevel}
             onThinkingLevelChange={(level) => setOption('thinkingLevel', level)}
             permissionMode={sessionOpts.permissionMode}
+            previousPermissionMode={sessionOpts.previousPermissionMode}
             onPermissionModeChange={setPermissionMode}
             enabledModes={enabledModes}
             inputValue={inputValue}
