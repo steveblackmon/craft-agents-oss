@@ -110,6 +110,7 @@ export function createWebApi(options: WebApiOptions): {
     getVersions: () => ({ node: 'n/a', chrome: navigator.userAgent, electron: 'web' }),
     getRuntimeEnvironment: () => 'web',
     getSystemWarnings: () => Promise.resolve({ vcredistMissing: false }),
+    getWindowVibrancy: () => null, // browsers paint an opaque canvas
     isDebugMode: () => Promise.resolve(import.meta.env.DEV),
 
     // Theme

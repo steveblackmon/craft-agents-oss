@@ -161,7 +161,8 @@ export interface DecisionResult {
 export type DecisionFailureKind =
   | 'disabled'        // master switch or feature toggle off
   | 'unconfigured'    // no key / no base URL / unknown connection
-  | 'timeout'         // deadline exceeded or aborted
+  | 'timeout'         // deadline exceeded
+  | 'cancelled'       // the caller aborted (Stop, a superseded turn)
   | 'auth'            // 401 / 403
   | 'rate_limited'    // 429
   | 'invalid_request' // 400 / 422 or client-side validation
