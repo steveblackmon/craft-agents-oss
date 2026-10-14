@@ -2,7 +2,7 @@
  * Session Self-Management Bindings
  *
  * Attaches the session-scoped tool properties (session management, tasks,
- * messaging, pages, decide) to a SessionToolContext using
+ * messaging, pages, MCP resources/prompts, decide) to a SessionToolContext using
  * Object.defineProperty with non-memoized lazy getters. Each access resolves
  * the callback from the session-scoped tool callback registry at call time,
  * so late merges and callback replacements are immediately visible without
@@ -26,7 +26,8 @@ import { getSessionScopedToolCallbacks } from './session-scoped-tool-callback-re
  * Attach session self-management bindings to a SessionToolContext.
  *
  * Defines lazy getters for the session-management callbacks (labels, status,
- * archive, list/info, resolve helpers), messaging, createTask, and pages.
+ * archive, list/info, resolve helpers), messaging, createTask, project memory
+ * appends, pages, MCP source resources/prompts, and decide.
  *
  * @param context - The SessionToolContext to augment (mutated in place)
  * @param sessionId - The session ID for registry lookup and getSessionInfo defaulting
@@ -142,9 +143,25 @@ export function attachSessionSelfManagementBindings(
     enumerable: true,
   });
 
+  Object.defineProperty(context, 'appendProjectMemory', {
+    get() {
+      return getSessionScopedToolCallbacks(sessionId)?.appendProjectMemoryFn;
+    },
+    configurable: true,
+    enumerable: true,
+  });
+
   Object.defineProperty(context, 'pages', {
     get() {
       return getSessionScopedToolCallbacks(sessionId)?.pages;
+    },
+    configurable: true,
+    enumerable: true,
+  });
+
+  Object.defineProperty(context, 'mcpSources', {
+    get() {
+      return getSessionScopedToolCallbacks(sessionId)?.mcpSources;
     },
     configurable: true,
     enumerable: true,

@@ -158,6 +158,8 @@ export type {
   ResolvedStatusResult,
   CreateTaskInput,
   CreateTaskResult,
+  ProjectMemoryAppendInput,
+  ProjectMemoryAppendResult,
   // Pages types
   PagesToolCallbacks,
   PageToolRefreshSpec,
@@ -169,6 +171,14 @@ export type {
   PageDataToolPatch,
   PageDataWriteSummary,
   DeletePageToolResult,
+  // MCP source resources & prompts types
+  McpSourceToolCallbacks,
+  McpSourceResource,
+  McpSourceResourceTemplate,
+  McpSourceResourceList,
+  McpSourcePrompt,
+  McpSourcePromptArgument,
+  McpSourcePromptList,
   // Decision tool types
   DecisionToolCallbacks,
   DecisionToolQuestionType,
@@ -204,6 +214,11 @@ export {
   handleMicrosoftOAuthTrigger,
   // Credential Prompt
   handleCredentialPrompt,
+  // MCP source resources & prompts
+  handleSourceListResources,
+  handleSourceReadResource,
+  handleSourceListPrompts,
+  handleSourceGetPrompt,
   // Update Preferences
   handleUpdatePreferences,
   // Transform Data
@@ -236,6 +251,10 @@ export type {
   SlackOAuthTriggerArgs,
   MicrosoftOAuthTriggerArgs,
   CredentialPromptArgs,
+  SourceListResourcesArgs,
+  SourceReadResourceArgs,
+  SourceListPromptsArgs,
+  SourceGetPromptArgs,
   UpdatePreferencesArgs,
   TransformDataArgs,
   ScriptSandboxArgs,
@@ -260,6 +279,11 @@ export {
   SourceTestSchema,
   SourceOAuthTriggerSchema,
   CredentialPromptSchema,
+  // MCP source resources & prompts schemas
+  SourceListResourcesSchema,
+  SourceReadResourceSchema,
+  SourceListPromptsSchema,
+  SourceGetPromptSchema,
   CallLlmSchema,
   DecideSchema,
   UpdatePreferencesSchema,
