@@ -233,6 +233,7 @@ const PI_AUTH_PROVIDER_DISPLAY_NAMES: Record<string, string> = {
   google: 'Google AI Studio',
   openrouter: 'OpenRouter',
   'azure-openai-responses': 'Azure OpenAI',
+  'cloudflare-ai-gateway': 'Cloudflare AI Gateway',
   'amazon-bedrock': 'Amazon Bedrock',
   groq: 'Groq',
   mistral: 'Mistral',

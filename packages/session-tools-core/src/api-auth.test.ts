@@ -30,6 +30,21 @@ describe('parseJsonHeaderMap', () => {
       expect(parseJsonHeaderMap(raw)).toBeNull();
     }
   });
+
+  // Security review "High #5": an object secret (service-account JSON) must never be
+  // spread across headers. Its keys are tokens, but values span lines or names are not
+  // header names, so it is not a header map.
+  test('rejects object secrets that are not headers', () => {
+    const serviceAccount = JSON.stringify({
+      type: 'service_account',
+      client_email: 'bot@project.iam.gserviceaccount.com',
+      private_key: '-----BEGIN PRIVATE KEY-----\nMIIEv...\n-----END PRIVATE KEY-----\n',
+    });
+    expect(parseJsonHeaderMap(serviceAccount)).toBeNull();
+    expect(parseJsonHeaderMap(JSON.stringify({ 'api key': 'v' }))).toBeNull();
+    expect(parseJsonHeaderMap(JSON.stringify({ 'X-Key': 'a\r\nX-Injected: b' }))).toBeNull();
+    expect(parseJsonHeaderMap(JSON.stringify({ 'X-Key': 'tab\tis fine' }))).toEqual({ 'X-Key': 'tab\tis fine' });
+  });
 });
 
 describe('parseStoredApiCredential', () => {
@@ -65,6 +80,12 @@ describe('parseStoredApiCredential', () => {
     expect(parseStoredApiCredential(KEY, { authType: 'header', headerName: 'x-goog-api-key' })).toBe(KEY);
     expect(parseStoredApiCredential('tok', { authType: 'bearer' })).toBe('tok');
     expect(parseStoredApiCredential('not-json{{{', { authType: 'header', headerNames: ['A', 'B'] })).toBe('not-json{{{');
+  });
+
+  test('header auth never spreads a service-account JSON, configured header or not', () => {
+    const serviceAccount = JSON.stringify({ type: 'service_account', private_key: 'line1\nline2' });
+    expect(parseStoredApiCredential(serviceAccount, { authType: 'header' })).toBe(serviceAccount);
+    expect(parseStoredApiCredential(serviceAccount, { authType: 'header', headerName: 'X-API-Key' })).toBe(serviceAccount);
   });
 
   test('bearer and query credentials are never parsed as header maps', () => {

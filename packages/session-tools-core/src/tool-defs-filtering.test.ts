@@ -74,6 +74,8 @@ describe('session tool filtering helpers', () => {
     expect(blocked.has('source_oauth_trigger')).toBe(true);
     expect(blocked.has('source_credential_prompt')).toBe(true);
     expect(blocked.has('spawn_session')).toBe(true);
+    // Writes the project's MEMORY.md
+    expect(blocked.has('project_memory_append')).toBe(true);
 
     // Pages: reads are Explore-safe, mutations are not
     expect(allowed.has('list_pages')).toBe(true);
@@ -82,6 +84,14 @@ describe('session tool filtering helpers', () => {
     expect(blocked.has('update_page')).toBe(true);
     expect(blocked.has('write_page_data')).toBe(true);
     expect(blocked.has('delete_page')).toBe(true);
+  });
+
+  it('MCP source resource and prompt tools are read-only and Explore-safe', () => {
+    const allowed = getSessionSafeAllowedToolNames({ prefix: 'mcp__session__' });
+    for (const name of ['source_list_resources', 'source_read_resource', 'source_list_prompts', 'source_get_prompt']) {
+      expect(allowed.has(`mcp__session__${name}`)).toBe(true);
+      expect(SESSION_TOOL_DEFS.some(d => d.name === name && d.executionMode === 'registry' && d.readOnly === true)).toBe(true);
+    }
   });
 
   it('safe-mode helpers support MCP prefixing', () => {

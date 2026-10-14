@@ -48,10 +48,17 @@ export function isMultiHeaderCredential(cred: ApiCredential): cred is MultiHeade
   return typeof cred === 'object' && cred !== null && !('username' in cred && 'password' in cred);
 }
 
+/** An HTTP field name (RFC 9110 token). */
+const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/;
+/** A single-line field value: no control characters but tab. */
+const HEADER_VALUE = /^[^\x00-\x08\x0a-\x1f\x7f]*$/;
+
 /**
- * Parse a JSON object whose values are all strings, the shape the multi-header
- * credential prompt writes. Returns null for anything else, including empty
- * objects, arrays and JSON scalars, so real API keys are never mistaken for it.
+ * Parse a JSON object of HTTP headers, the shape the credential prompt writes:
+ * every key a header name, every value a single-line header value. Returns null
+ * for anything else, including empty objects, arrays, JSON scalars and object
+ * secrets such as a service-account JSON (its private key spans lines), so
+ * those are never spread across headers.
  */
 export function parseJsonHeaderMap(raw: string): MultiHeaderCredential | null {
   const trimmed = raw.trim();
@@ -64,7 +71,9 @@ export function parseJsonHeaderMap(raw: string): MultiHeaderCredential | null {
   }
   if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
   const entries = Object.entries(parsed as Record<string, unknown>);
-  if (entries.length === 0 || !entries.every(([, value]) => typeof value === 'string')) return null;
+  const isHeader = ([name, value]: [string, unknown]) =>
+    HEADER_NAME.test(name) && typeof value === 'string' && HEADER_VALUE.test(value);
+  if (entries.length === 0 || !entries.every(isHeader)) return null;
   return parsed as MultiHeaderCredential;
 }
 
@@ -98,8 +107,9 @@ export function apiAuthSpecFromConfig(api: {
  *
  * - `basic`: `{"username","password"}` JSON becomes a BasicAuthCredential; anything
  *   else passes through as the raw string.
- * - Header maps (JSON objects of strings) are recognized for `header` auth and
- *   for any source with `headerNames`:
+ * - Header maps (JSON objects of header names to single-line values, see
+ *   parseJsonHeaderMap) are recognized for `header` auth and for any source with
+ *   `headerNames`:
  *   - configured `headerNames`: the map when every configured name is present,
  *     otherwise the raw string so the misconfiguration stays visible;
  *   - a single configured `headerName` holding exactly that key: the bare value,
@@ -133,10 +143,8 @@ export function parseStoredApiCredential(raw: string, api: StoredCredentialShape
   if (api?.headerName && keys.length === 1 && keys[0] === api.headerName) {
     return headerMap[api.headerName]!;
   }
-  // No configured header names and no single-header match: the credential is not
-  // intended as a header map — spreading arbitrary JSON keys (e.g. a service-account
-  // object) as header names would corrupt the request.
-  if (configuredNames.length === 0) return raw;
+  // The prompt stores the header the user typed when it is not `headerName`: send it
+  // under that name. Object secrets never get here (parseJsonHeaderMap rejects them).
   return headerMap;
 }
 

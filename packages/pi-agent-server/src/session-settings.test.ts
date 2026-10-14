@@ -23,6 +23,7 @@ describe('createCraftSettingsManager', () => {
       enabled: true,
       maxRetries: CRAFT_PI_RETRY_SETTINGS.maxRetries,
       baseDelayMs: CRAFT_PI_RETRY_SETTINGS.baseDelayMs,
+      maxAgentDelayMs: CRAFT_PI_RETRY_SETTINGS.maxAgentDelayMs,
     });
   });
 
@@ -43,6 +44,7 @@ describe('createCraftSettingsManager', () => {
       enabled: true,
       maxRetries: CRAFT_PI_EPHEMERAL_RETRY_SETTINGS.maxRetries,
       baseDelayMs: CRAFT_PI_EPHEMERAL_RETRY_SETTINGS.baseDelayMs,
+      maxAgentDelayMs: CRAFT_PI_EPHEMERAL_RETRY_SETTINGS.maxAgentDelayMs,
     });
     expect(settings.getProviderRetrySettings()).toMatchObject({
       maxRetries: CRAFT_PI_EPHEMERAL_RETRY_SETTINGS.provider.maxRetries,
@@ -57,6 +59,19 @@ describe('createCraftSettingsManager', () => {
 
   it('keeps auto-compaction enabled', () => {
     expect(createCraftSettingsManager().getCompactionEnabled()).toBe(true);
+  });
+
+  it('warms the prompt cache during chat runs but never for one-shot utility sessions', () => {
+    expect(createCraftSettingsManager().getCacheWarmingMode()).toBe('streaming');
+    expect(createCraftSettingsManager('ephemeral').getCacheWarmingMode()).toBe('off');
+  });
+
+  it('never trusts the working directory as a Pi project', () => {
+    // A trusted project auto-loads <cwd>/.pi/extensions (code), skills, prompts
+    // and SYSTEM.md. The SDK's in-memory default trusts the project.
+    expect(SettingsManager.inMemory().isProjectTrusted()).toBe(true);
+    expect(createCraftSettingsManager().isProjectTrusted()).toBe(false);
+    expect(createCraftSettingsManager('ephemeral').isProjectTrusted()).toBe(false);
   });
 
   it('ignores a .pi/settings.json in the working directory', () => {

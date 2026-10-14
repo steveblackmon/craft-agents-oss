@@ -881,9 +881,12 @@ export class SourceCredentialManager {
    * This is important because:
    * - Multiple API calls may hit refresh simultaneously when token is expiring
    * - Microsoft rotates refresh tokens, so concurrent refreshes could cause token invalidation
+   *
+   * Keyed like the stored credential (workspace + slug): two workspaces can each have a
+   * source with the same slug, and must never share a refresh or get each other's token.
    */
   async refresh(source: LoadedSource): Promise<string | null> {
-    const key = source.config.slug;
+    const key = `${source.workspaceId}::${source.config.slug}`;
 
     // Return existing refresh promise if one is in progress
     const pending = this.pendingRefreshes.get(key);

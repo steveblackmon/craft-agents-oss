@@ -43,6 +43,20 @@ export type {
 export { handleCredentialPrompt } from './credential-prompt.ts';
 export type { CredentialPromptArgs } from './credential-prompt.ts';
 
+// MCP source resources & prompts
+export {
+  handleSourceListResources,
+  handleSourceReadResource,
+  handleSourceListPrompts,
+  handleSourceGetPrompt,
+} from './mcp-sources.ts';
+export type {
+  SourceListResourcesArgs,
+  SourceReadResourceArgs,
+  SourceListPromptsArgs,
+  SourceGetPromptArgs,
+} from './mcp-sources.ts';
+
 // Update Preferences
 export { handleUpdatePreferences } from './update-preferences.ts';
 export type { UpdatePreferencesArgs } from './update-preferences.ts';
@@ -76,6 +90,8 @@ export { handleListBackgroundTasks } from './list-background-tasks.ts';
 export type { ListBackgroundTasksArgs } from './list-background-tasks.ts';
 export { handleCreateTask } from './create-task.ts';
 export type { CreateTaskArgs } from './create-task.ts';
+export { handleProjectMemoryAppend } from './project-memory.ts';
+export type { ProjectMemoryAppendArgs } from './project-memory.ts';
 export { handleArchiveSession } from './archive-session.ts';
 export type { ArchiveSessionArgs } from './archive-session.ts';
 
