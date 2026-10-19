@@ -98,6 +98,8 @@ export interface SessionTokenUsage {
   contextWindow?: number;
   /** Current occupancy, independent from billable/cumulative token counters. */
   contextUsage?: ContextUsageSnapshot;
+  /** Backend running totals already counted into costUsd/outputTokens (see AgentEventUsage.runningTotals). */
+  lastRunningTotals?: { costUsd: number; outputTokens: number };
 }
 
 /**

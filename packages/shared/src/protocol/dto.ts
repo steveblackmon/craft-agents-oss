@@ -807,6 +807,7 @@ export interface WorkspaceSettings {
   localMcpEnabled?: boolean
   defaultLlmConnection?: string
   enabledSourceSlugs?: string[]
+  chatStarters?: Array<{ label: string; prompt: string }>
 }
 
 // ---------------------------------------------------------------------------

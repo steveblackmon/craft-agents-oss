@@ -695,6 +695,12 @@ export interface ElectronAPI {
   setDefaultLlmConnection(slug: string): Promise<{ success: boolean; error?: string }>
   getDefaultThinkingLevel(): Promise<ThinkingLevel>
   setDefaultThinkingLevel(level: ThinkingLevel): Promise<{ success: boolean; error?: string }>
+  /** Claude auto-compact window in tokens; null = the SDK default (the model's full window) */
+  getAutoCompactWindow(): Promise<number | null>
+  setAutoCompactWindow(tokens: number | null): Promise<void>
+  /** Model for Claude subagents whose call names none; null = the session's model */
+  getSubagentModel(): Promise<'haiku' | 'sonnet' | null>
+  setSubagentModel(model: 'haiku' | 'sonnet' | null): Promise<void>
   setWorkspaceDefaultLlmConnection(workspaceId: string, slug: string | null): Promise<{ success: boolean; error?: string }>
 
   // Projects (workspace-scoped)

@@ -6,6 +6,7 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Contributor Covenant](https://img.shields.io/badge/Contributor%20Covenant-2.1-4baaaa.svg)](CODE_OF_CONDUCT.md)
+[![Discord](https://img.shields.io/badge/Discord-Come%20join%20our%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/bwskSM82p)
 
 ## How it Works (Video)
 To understand what Craft Agents does and how it works watch this video.

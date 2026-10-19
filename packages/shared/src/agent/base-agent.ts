@@ -49,6 +49,7 @@ import type { Workspace } from '../config/storage.ts';
 // Core modules
 import { PermissionManager } from './core/permission-manager.ts';
 import type { GuardedModeCheck } from './core/guarded-mode.ts';
+import type { SubagentModelPicker } from './core/subagent-model.ts';
 import { SourceManager } from './core/source-manager.ts';
 import { PromptBuilder } from './core/prompt-builder.ts';
 import { PathProcessor } from './core/path-processor.ts';
@@ -254,6 +255,8 @@ export abstract class BaseAgent implements AgentBackend {
   onPermissionRequest: PermissionCallback | null = null;
   /** Guarded-mode risk check (decision model): may turn an allowed call into a prompt, never the reverse. */
   guardedModeCheck: GuardedModeCheck | null = null;
+  /** Subagent model choice (decision model, Claude only): picks a cheaper model for an Agent call. */
+  subagentModelPicker: SubagentModelPicker | null = null;
   onPlanSubmitted: PlanCallback | null = null;
   onAuthRequest: AuthCallback | null = null;
   onSourceChange: SourceChangeCallback | null = null;

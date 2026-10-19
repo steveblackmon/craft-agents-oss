@@ -58,6 +58,7 @@ import {
   getSessionPath as getSessionStoragePath,
   ensureSessionDir,
   getSessionFilePath,
+  readSessionHeader,
   generateSessionId,
   sessionPersistenceQueue,
   getHeaderMetadataSignature,
@@ -110,6 +111,7 @@ import { isDecisionFeatureActive, type DecisionLayerFeature, type DecisionResult
 import { setLargeResultFilter } from '@craft-agent/shared/utils'
 import { buildLargeResultFilter, finishLargeResultExcerpts, noteLargeResultFileUse } from '../decisions/large-results'
 import { buildGuardedModeCheck } from '../decisions/guarded-mode'
+import { buildSubagentModelPicker } from '../decisions/subagent-models'
 import { assessPermissionRisks } from '../decisions/permission-risks'
 import { checkAutomationCondition } from '../decisions/automation-condition'
 import { listLabels, loadLabelConfig } from '@craft-agent/shared/labels/storage'
@@ -119,6 +121,7 @@ import { loadStatusConfig } from '@craft-agent/shared/statuses/storage'
 import { AutomationSystem, createPromptHistoryEntry, appendAutomationHistoryEntry, type AutomationSystemMetadataSnapshot, type PendingPrompt } from '@craft-agent/shared/automations'
 import { buildBackendRuntimeSignature, buildRestartRequiredSignature, filterAttachmentsForModelInput } from './runtime-config'
 import { validateArchiveTarget } from './archive-guards'
+import { addTurnUsage, branchStartTotals, type BranchParent } from './turn-usage'
 
 // Import from server-core domain utilities
 import { sanitizeForTitle, shouldActivateBrowserOverlay, normalizeBrowserToolName, rollbackFailedBranchCreation, releaseBrowserOwnershipOnForcedStop } from '@craft-agent/server-core/domain'
@@ -766,6 +769,8 @@ interface ManagedSession {
     contextWindow?: number
     /** Current occupancy, separate from cumulative/billable counters. */
     contextUsage?: ContextUsageSnapshot
+    /** Backend running totals already counted into costUsd/outputTokens (see `addTurnUsage`). */
+    lastRunningTotals?: { costUsd: number; outputTokens: number }
   }
   // Session status (user-controlled) - determines open vs closed
   // Dynamic status ID referencing workspace status config
@@ -2551,6 +2556,13 @@ export class SessionManager implements ISessionManager {
     }
   }
 
+  /** The session a branch was forked from: live in memory, else its header on disk. */
+  private branchParent(managed: ManagedSession): BranchParent | null {
+    if (!managed.branchFromSessionPath) return null
+    const parentId = basename(managed.branchFromSessionPath)
+    return this.sessions.get(parentId) ?? readSessionHeader(getSessionFilePath(managed.workspace.rootPath, parentId))
+  }
+
   // Suppress fs.watch metadata-revert events for the window in which our own
   // atomic write completes. See onSessionMetadataChange.
   private setMetadataWriteGuard(managed: ManagedSession): void {
@@ -4021,6 +4033,8 @@ export class SessionManager implements ISessionManager {
         // Retire branch-only fork metadata now that child session is established
         if (managed.branchFromSdkSessionId) {
           sessionLog.info(`Branch fork established for ${managed.id}: child=${sdkSessionId}, retiring parent fork metadata (parent=${managed.branchFromSdkSessionId})`)
+          const startTotals = branchStartTotals(this.branchParent(managed), managed.branchFromSdkSessionId)
+          if (startTotals) managed.tokenUsage = { ...(managed.tokenUsage ?? DEFAULT_TOKEN_USAGE), lastRunningTotals: startTotals }
           managed.branchFromSdkSessionId = undefined
           managed.branchFromSdkCwd = undefined
           managed.branchFromSdkTurnId = undefined
@@ -4140,6 +4154,7 @@ export class SessionManager implements ISessionManager {
         systemPromptPreset: managed.systemPromptPreset,
         debugMode: _platform?.isDebugMode ? { enabled: true, logFilePath: _platform.getLogFilePath?.() } : undefined,
         enable1MContext: await (async () => { const { getEnable1MContext } = await import('@craft-agent/shared/config/storage'); return getEnable1MContext(); })(),
+        autoCompactWindow: await (async () => { const { getAutoCompactWindow } = await import('@craft-agent/shared/config/storage'); return getAutoCompactWindow(); })(),
         // Image resize callback — prevents oversized images from entering conversation history
         onImageResize: async (filePath: string, maxSizeBytes: number): Promise<string | null> => {
           try {
@@ -4556,6 +4571,12 @@ export class SessionManager implements ISessionManager {
         sessionId: managed.id,
         log: (line) => sessionLog.info(line),
         isInteractive: () => isAttendedSession(managed),
+      })
+      // Subagent model choice (decision model, toggle `subagentModels`): the Claude agent asks it
+      // for Agent calls that name no model; no answer leaves the Settings default in charge.
+      managed.agent.subagentModelPicker = buildSubagentModelPicker({
+        sessionId: managed.id,
+        log: (line) => sessionLog.info(line),
       })
 
       managed.agent.onPermissionRequest = (request: {
@@ -9331,9 +9352,8 @@ export class SessionManager implements ISessionManager {
           // Each API call sends the full conversation history, so we use the latest value
           managed.tokenUsage.inputTokens = event.usage.inputTokens
           // outputTokens and costUsd are accumulated across all turns (total session usage)
-          managed.tokenUsage.outputTokens += event.usage.outputTokens
+          addTurnUsage(managed.tokenUsage, event.usage)
           managed.tokenUsage.totalTokens = managed.tokenUsage.inputTokens + managed.tokenUsage.outputTokens
-          managed.tokenUsage.costUsd += event.usage.costUsd ?? 0
           // Cache tokens reflect current state, not accumulated
           managed.tokenUsage.cacheReadTokens = event.usage.cacheReadTokens ?? 0
           managed.tokenUsage.cacheCreationTokens = event.usage.cacheCreationTokens ?? 0

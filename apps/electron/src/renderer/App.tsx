@@ -1348,12 +1348,15 @@ export default function App() {
             }
             // Include storedPath and markdownPath for all attachment types
             // Agent will use Read tool to access text/office files via these paths
-            // If image was resized, use the resized base64 for Claude API
+            // If image was resized/normalized, use the stored base64 + mimeType for Claude API
             return {
               ...att,
               storedPath: stored.storedPath,
               markdownPath: stored.markdownPath,
-              // Use resized base64 if available (for images that exceeded size limits)
+              // Reflect any server-side normalization (e.g. HEIC/HEIF → JPEG) so the
+              // model receives a supported media type instead of silently dropping the image.
+              mimeType: stored.mimeType,
+              // Use resized/normalized base64 when the store produced one
               base64: stored.resizedBase64 ?? att.base64,
             }
           })

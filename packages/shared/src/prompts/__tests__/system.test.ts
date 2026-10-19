@@ -29,6 +29,15 @@ describe('system prompt guidance', () => {
     expect(prompt.length).toBeLessThan(22_000)
   })
 
+  it('limits subagents only where the Agent tool exists (Claude)', () => {
+    const claude = getSystemPrompt(undefined, undefined, '/tmp/workspace', '/tmp/workspace')
+    const pi = getSystemPrompt(undefined, undefined, '/tmp/workspace', '/tmp/workspace', undefined, 'Craft Agents Backend')
+
+    expect(claude).toContain('## Subagents (Agent tool)')
+    expect(claude).toContain('Use `Explore` for read-only searches')
+    expect(pi).not.toContain('## Subagents (Agent tool)')
+  })
+
   it('treats date/time as current now without overriding explicit dated content', () => {
     const context = getDateTimeContext()
 

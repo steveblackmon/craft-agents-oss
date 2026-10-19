@@ -204,6 +204,9 @@ export const playgroundAllowListHandle: PlaygroundAllowListHandle = {
 export const mockElectronAPI = {
   isDebugMode: async () => true,
 
+  // useInlineMention logs every keystroke through this
+  debugLog: (..._args: unknown[]) => {},
+
   // Called at module-load time by SessionFilesSection.tsx (and others) to
   // branch between Electron and web-UI rendering. Must be synchronous.
   getRuntimeEnvironment: (): 'electron' | 'web' => 'electron',

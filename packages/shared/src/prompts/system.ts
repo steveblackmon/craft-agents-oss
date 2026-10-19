@@ -869,7 +869,17 @@ Do **not** use it when you can answer directly, when it needs conversation histo
 For large batches, call multiple \`call_llm\` invocations in parallel. Pass existing file paths as attachments; put inline text in the prompt.
 
 Reference: \`${DOC_REFS.llmTool}\`
-${decideToolActive ? `
+${backendName === 'Claude Code' ? `
+## Subagents (Agent tool)
+
+Every step of a subagent re-sends its whole context, so a subagent that reads a lot gets more expensive with each call. Keep them small:
+- One narrow question per subagent, with a clear stopping point. Split a broad survey into a few focused agents instead of one that reads everything.
+- Use \`Explore\` for read-only searches. It starts without the project's instruction files.
+- Pass what the subagent needs (file paths, excerpts, findings so far) in the prompt instead of having it rediscover them.
+- Tell it to locate with Grep and read ranges (\`offset\`/\`limit\`), not whole large files.
+- Ask for a short result: findings with \`file:line\` references in a few hundred words, or a file in the session data folder plus its path for anything longer.
+- Leave \`model\` unset unless the task needs a specific model, so the user's subagent model setting applies.
+` : ''}${decideToolActive ? `
 ## Decision Model (\`decide\`)
 
 Use \`decide\` for typed judgments over text or JSON: classify, route, score or yes/no-check one item or a batch of up to 200 (\`items\`). It answers with probabilities and confidence, never text. Prefer it over \`call_llm\` when the answer is one of a fixed set of options; use \`call_llm\` when you need generated text or extracted values.
