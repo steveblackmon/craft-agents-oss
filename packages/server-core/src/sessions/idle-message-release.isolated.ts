@@ -197,6 +197,21 @@ describe('idle message release', () => {
     expect(uploaded.messages.map((x: any) => x.content)).toEqual(['question', 'answer'])
   })
 
+  it('snapshots an unqueued late message before release', async () => {
+    await sm.flushSession(m.id)
+    m.messages.push({ id: 'late', role: 'info', content: 'late result', timestamp: 3 })
+    expect(sessionPersistenceQueue.hasUnflushed(m.id)).toBe(false)
+    await sm.sweepIdleRuntimes()
+    expect(m.messagesLoaded).toBe(false)
+    expect((await sm.getSession(m.id))?.messages.map(x => x.content)).toEqual(['question', 'answer', 'late result'])
+  })
+
+  it('retains history if snapshot conversion fails', async () => {
+    spies.push(spyOn(sm as any, 'enqueuePersist').mockReturnValue(false))
+    await sm.sweepIdleRuntimes()
+    expect(m.messagesLoaded).toBe(true)
+  })
+
   it('the existing disable switch disables history eviction too', async () => {
     ;(sm as any).idleDisposeMs = 0
     await sm.sweepIdleRuntimes()
