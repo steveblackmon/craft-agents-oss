@@ -58,7 +58,7 @@ function mergeHeaderWithExternalMetadata(localHeader: SessionHeader, diskHeader:
  */
 class SessionPersistenceQueue {
   private pending = new Map<string, PendingWrite>()
-  private writeInProgress = new Map<string, Promise<void>>()
+  private writeInProgress = new Map<string, Promise<boolean>>()
   private lastWrittenHeaderSignature = new Map<string, string>()
   private debounceMs: number
 
@@ -77,7 +77,7 @@ class SessionPersistenceQueue {
     }
 
     const timer = setTimeout(() => {
-      void this.write(session.id)
+      void this.flush(session.id)
     }, this.debounceMs)
 
     this.pending.set(session.id, { data: session, timer })
@@ -87,11 +87,12 @@ class SessionPersistenceQueue {
    * Write a session to disk immediately in JSONL format.
    * Uses atomic write (write-to-temp-then-rename) to prevent corruption on crash.
    */
-  private async write(sessionId: string): Promise<void> {
+  private async write(sessionId: string): Promise<boolean> {
     const entry = this.pending.get(sessionId)
-    if (!entry) return
+    if (!entry) return true
 
     this.pending.delete(sessionId)
+    clearTimeout(entry.timer)
 
     try {
       const { data } = entry
@@ -160,8 +161,13 @@ class SessionPersistenceQueue {
       try { await unlink(filePath) } catch { /* ignore if doesn't exist */ }
       await rename(tmpFile, filePath)
       debug(`[PersistenceQueue] Wrote session ${sessionId}`)
+      return true
     } catch (error) {
+      // Retain the snapshot for retry. An eviction must never mistake a failed
+      // write for a durable history. A newer queued snapshot takes precedence.
+      if (!this.pending.has(sessionId)) this.pending.set(sessionId, entry)
       console.error(`[PersistenceQueue] Failed to write session ${sessionId}:`, error)
+      return false
     }
   }
 
@@ -171,25 +177,28 @@ class SessionPersistenceQueue {
    * to prevent race conditions on the shared .tmp file.
    */
   async flush(sessionId: string): Promise<void> {
-    const entry = this.pending.get(sessionId)
-    if (entry) {
-      clearTimeout(entry.timer)
-
-      // Wait for any in-progress write to complete first
+    // Includes timer-started writes, not just explicit flushes. Install the
+    // promise before yielding so concurrent flushes serialize on the same file.
+    while (true) {
       const inProgress = this.writeInProgress.get(sessionId)
       if (inProgress) {
-        await inProgress
+        // A failed write is retained, but retry only on the next flush call.
+        if (!await inProgress) return
+        continue
       }
-
-      // Start new write and track it
+      if (!this.pending.has(sessionId)) return
       const writePromise = this.write(sessionId)
       this.writeInProgress.set(sessionId, writePromise)
-
+      let succeeded: boolean
       try {
-        await writePromise
+        succeeded = await writePromise
       } finally {
-        this.writeInProgress.delete(sessionId)
+        if (this.writeInProgress.get(sessionId) === writePromise) {
+          this.writeInProgress.delete(sessionId)
+        }
       }
+      // Drain newer snapshots too; stop on failure rather than retrying forever.
+      if (!succeeded) return
     }
   }
 
@@ -210,7 +219,7 @@ class SessionPersistenceQueue {
    * Flush all pending sessions. Call this on app quit.
    */
   async flushAll(): Promise<void> {
-    const sessionIds = [...this.pending.keys()]
+    const sessionIds = [...new Set([...this.pending.keys(), ...this.writeInProgress.keys()])]
     await Promise.all(sessionIds.map(id => this.flush(id)))
   }
 
@@ -219,6 +228,11 @@ class SessionPersistenceQueue {
    */
   hasPending(sessionId: string): boolean {
     return this.pending.has(sessionId)
+  }
+
+  /** Pending, failed (retained for retry), or currently writing to disk. */
+  hasUnflushed(sessionId: string): boolean {
+    return this.pending.has(sessionId) || this.writeInProgress.has(sessionId)
   }
 
   /**

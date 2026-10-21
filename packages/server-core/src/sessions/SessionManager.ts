@@ -986,6 +986,9 @@ interface ManagedSession {
   suggestionTrace?: { trace: SuggestionTrace; used: Set<string> }
   // Idle runtime eviction (electinfo/ops#549). Runtime-only, never persisted.
   // Last time anything touched the runtime: a send, a turn start/stop, any agent event.
+  /** Last history access; separate from subprocess activity. */
+  lastMessageAccessAt?: number
+  messageAccessVersion?: number
   lastRuntimeActivityAt?: number
   // Tool holds (ScheduleWakeup / Monitor / CronCreate) keyed by hold key → expiry ms.
   runtimeHolds?: Map<string, number>
@@ -2613,6 +2616,8 @@ export class SessionManager implements ISessionManager {
   // Subsequent ensureMessagesLoaded calls also short-circuit, which is fine —
   // queue recovery has already run here.
   private hydrateMessagesForColdPersist(managed: ManagedSession): void {
+    managed.lastMessageAccessAt = Date.now()
+    managed.messageAccessVersion = (managed.messageAccessVersion ?? 0) + 1
     sessionLog.debug(`Cold-load triggered for persistSession on ${managed.id}`)
     const stored = loadStoredSession(managed.workspace.rootPath, managed.id)
     if (stored) {
@@ -2633,6 +2638,7 @@ export class SessionManager implements ISessionManager {
       // Queue recovery: find orphaned queued messages from crash/restart and re-queue them.
       const orphanedQueued = managed.messages.filter(m =>
         m.role === 'user' && m.isQueued === true
+        && !managed.messageQueue.some(entry => entry.messageId === m.id)
       )
       if (orphanedQueued.length > 0) {
         sessionLog.info(`Recovering ${orphanedQueued.length} queued message(s) for session ${managed.id}`)
@@ -2745,6 +2751,8 @@ export class SessionManager implements ISessionManager {
       return
     }
 
+    if (!managed.messagesLoaded) this.hydrateMessagesForColdPersist(managed)
+
     // Find and update the pending auth-request message
     const authMessage = managed.messages.find(m =>
       m.role === 'auth-request' &&
@@ -2827,6 +2835,7 @@ export class SessionManager implements ISessionManager {
         if (pending.type !== 'credential' && pending.sourceSlug === sourceSlug) requestId = pending.requestId
       } else {
         const boundId = bound.get(managed.id)
+        if (boundId && !managed.messagesLoaded) this.hydrateMessagesForColdPersist(managed)
         if (boundId && managed.messages.some(m =>
           m.role === 'auth-request' && m.authRequestId === boundId && m.authStatus === 'pending')) {
           requestId = boundId
@@ -3093,6 +3102,8 @@ export class SessionManager implements ISessionManager {
    * to load messages simultaneously.
    */
   private async ensureMessagesLoaded(managed: ManagedSession): Promise<void> {
+    managed.lastMessageAccessAt = Date.now()
+    managed.messageAccessVersion = (managed.messageAccessVersion ?? 0) + 1
     if (managed.messagesLoaded) return
 
     // Deduplicate concurrent loads - return existing promise if already loading
@@ -3142,6 +3153,7 @@ export class SessionManager implements ISessionManager {
       // Queue recovery: find orphaned queued messages from crash/restart and re-queue them
       const orphanedQueued = managed.messages.filter(m =>
         m.role === 'user' && m.isQueued === true
+        && !managed.messageQueue.some(entry => entry.messageId === m.id)
       )
       if (orphanedQueued.length > 0) {
         sessionLog.info(`Recovering ${orphanedQueued.length} queued message(s) for session ${managed.id}`)
@@ -3869,6 +3881,32 @@ export class SessionManager implements ISessionManager {
     return true
   }
 
+  /** History eviction uses the runtime idle threshold, but not its LRU cap.
+   * GUI-only sessions have no runtime and must still be swept. Every await is
+   * followed by a synchronous recheck, so a reader/send during a flush wins.
+   */
+  private async releaseIdleMessages(managed: ManagedSession, now: number): Promise<boolean> {
+    const accessVersion = managed.messageAccessVersion
+    const canRelease = () => managed.messagesLoaded
+      && managed.messageAccessVersion === accessVersion
+      && this.sessions.get(managed.id) === managed
+      && this.idleDisposeMs > 0
+      && now - Math.max(managed.lastMessageAccessAt ?? 0,
+        managed.lastRuntimeActivityAt ?? managed.lastMessageAt) >= this.idleDisposeMs
+      && !this.getRuntimeBusyReason(managed, now)
+      && !this.isSessionBeingViewed(managed.id, managed.workspace.id)
+      && !managed.isAsyncOperationOngoing
+      && !this.messageLoadingPromises.has(managed.id)
+    if (!canRelease()) return false
+    await this.flushSession(managed.id)
+    if (!canRelease() || sessionPersistenceQueue.hasUnflushed(managed.id)) return false
+    const count = managed.messages.length
+    managed.messages = []
+    managed.messagesLoaded = false
+    sessionLog.info(`Released ${count} messages for idle session ${managed.id}`)
+    return true
+  }
+
   /**
    * One eviction pass: dispose idle runtimes, then enforce the live-runtime cap.
    * Overlapping calls share the in-flight pass. Returns the disposed session ids.
@@ -3899,6 +3937,13 @@ export class SessionManager implements ISessionManager {
       }
       if (disposed.length > 0) {
         sessionLog.info(`Runtime sweep disposed ${disposed.length} runtime(s); ${live.length - disposed.length} live`)
+      }
+      for (const managed of this.sessions.values()) {
+        try {
+          await this.releaseIdleMessages(managed, now)
+        } catch (error) {
+          sessionLog.warn(`Message release failed for ${managed.id}: ${error instanceof Error ? error.message : error}`)
+        }
       }
       return disposed
     })()
@@ -5638,6 +5683,8 @@ export class SessionManager implements ISessionManager {
       throw new Error(`Session ${sessionId} not found`)
     }
 
+    await this.ensureMessagesLoaded(managed)
+
     // Only allow changing connection before first message (session hasn't started)
     if (managed.messages && managed.messages.length > 0) {
       sessionLog.warn(`setSessionConnection: cannot change connection after session has started (${sessionId})`)
@@ -5791,6 +5838,10 @@ export class SessionManager implements ISessionManager {
     this.sendEvent({ type: 'async_operation', sessionId, isOngoing: true }, managed.workspace.id)
 
     try {
+      await this.flushSession(sessionId)
+      if (sessionPersistenceQueue.hasUnflushed(sessionId)) {
+        return { success: false, error: 'Session has unflushed writes' }
+      }
       // Load session directly from disk (already in correct format)
       const storedSession = loadStoredSession(managed.workspace.rootPath, sessionId)
       if (!storedSession) {
@@ -5855,6 +5906,10 @@ export class SessionManager implements ISessionManager {
     this.sendEvent({ type: 'async_operation', sessionId, isOngoing: true }, managed.workspace.id)
 
     try {
+      await this.flushSession(sessionId)
+      if (sessionPersistenceQueue.hasUnflushed(sessionId)) {
+        return { success: false, error: 'Session has unflushed writes' }
+      }
       // Load session directly from disk (already in correct format)
       const storedSession = loadStoredSession(managed.workspace.rootPath, sessionId)
       if (!storedSession) {
@@ -6079,6 +6134,8 @@ export class SessionManager implements ISessionManager {
     // Only mark as read if not currently processing
     // (user is viewing but we want to wait for processing to complete)
     if (managed.isProcessing) return
+
+    await this.ensureMessagesLoaded(managed)
 
     let needsPersist = false
     const updates: { lastReadMessageId?: string; hasUnread?: boolean } = {}
@@ -6325,6 +6382,7 @@ export class SessionManager implements ISessionManager {
 
       // Check if we can also update sdkCwd (safe if no SDK interaction yet)
       // Conditions: no messages sent AND no agent created yet (no SDK session)
+      if (!managed.messagesLoaded) this.hydrateMessagesForColdPersist(managed)
       const shouldUpdateSdkCwd =
         managed.messages.length === 0 &&
         !managed.sdkSessionId &&
@@ -6399,6 +6457,9 @@ export class SessionManager implements ISessionManager {
       return
     }
 
+    if (!managed.messagesLoaded) this.hydrateMessagesForColdPersist(managed)
+    managed.lastMessageAccessAt = Date.now()
+    managed.messageAccessVersion = (managed.messageAccessVersion ?? 0) + 1
     const message = managed.messages.find(m => m.id === messageId)
     if (!message) {
       sessionLog.warn(`Cannot update message: message ${messageId} not found in session ${sessionId}`)
@@ -6422,6 +6483,9 @@ export class SessionManager implements ISessionManager {
       return
     }
 
+    if (!managed.messagesLoaded) this.hydrateMessagesForColdPersist(managed)
+    managed.lastMessageAccessAt = Date.now()
+    managed.messageAccessVersion = (managed.messageAccessVersion ?? 0) + 1
     const message = managed.messages.find(m => m.id === messageId)
     if (!message) {
       sessionLog.warn(`Cannot add annotation: message ${messageId} not found in session ${sessionId}`)
@@ -6488,6 +6552,9 @@ export class SessionManager implements ISessionManager {
       return
     }
 
+    if (!managed.messagesLoaded) this.hydrateMessagesForColdPersist(managed)
+    managed.lastMessageAccessAt = Date.now()
+    managed.messageAccessVersion = (managed.messageAccessVersion ?? 0) + 1
     const message = managed.messages.find(m => m.id === messageId)
     if (!message) {
       sessionLog.warn(`Cannot update annotation: message ${messageId} not found in session ${sessionId}`)
@@ -6562,6 +6629,9 @@ export class SessionManager implements ISessionManager {
       return
     }
 
+    if (!managed.messagesLoaded) this.hydrateMessagesForColdPersist(managed)
+    managed.lastMessageAccessAt = Date.now()
+    managed.messageAccessVersion = (managed.messageAccessVersion ?? 0) + 1
     const message = managed.messages.find(m => m.id === messageId)
     if (!message) {
       sessionLog.warn(`Cannot remove annotation: message ${messageId} not found in session ${sessionId}`)
@@ -7825,6 +7895,7 @@ export class SessionManager implements ISessionManager {
     const managed = this.sessions.get(sessionId)
     if (!managed || managed.messageQueue.length === 0) return
 
+    if (!managed.messagesLoaded) this.hydrateMessagesForColdPersist(managed)
     const first = managed.messageQueue.shift()!
     // Mid-turn messages: entries judged to continue this one are replayed with it as one turn.
     const merged: typeof managed.messageQueue = []
@@ -7970,6 +8041,7 @@ export class SessionManager implements ISessionManager {
     if (reported) return reported
     const toolUseId = managed.backgroundTaskRegistry.get(taskId)?.toolUseId
     if (!toolUseId) return undefined
+    if (!managed.messagesLoaded) this.hydrateMessagesForColdPersist(managed)
     const launch = managed.messages.find(message => message.toolUseId === toolUseId && message.toolResult)
     return launch?.toolResult ? launchOutputFile(launch.toolResult, taskId) : undefined
   }
@@ -8694,6 +8766,9 @@ export class SessionManager implements ISessionManager {
     const workspaceId = managed.workspace.id
     this.notifySessionActivity(sessionId)
     this.noteRuntimeActivity(managed, event)
+    // Late background notifications can arrive after an idle release. Hydrate
+    // synchronously before appending so persistence never clobbers old history.
+    if (!managed.messagesLoaded) this.hydrateMessagesForColdPersist(managed)
 
     switch (event.type) {
       case 'text_delta':
