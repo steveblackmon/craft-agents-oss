@@ -2619,7 +2619,9 @@ export class SessionManager implements ISessionManager {
     managed.lastMessageAccessAt = Date.now()
     managed.messageAccessVersion = (managed.messageAccessVersion ?? 0) + 1
     sessionLog.debug(`Cold-load triggered for persistSession on ${managed.id}`)
-    const stored = loadStoredSession(managed.workspace.rootPath, managed.id)
+    const stored = sessionPersistenceQueue.getLatestSnapshot(managed.id)
+      ?? loadStoredSession(managed.workspace.rootPath, managed.id)
+    if (!stored) throw new Error(`Cannot hydrate session ${managed.id}: history unavailable`)
     if (stored) {
       managed.messages = (stored.messages || []).map(storedToMessage)
       managed.tokenUsage = stored.tokenUsage
@@ -3128,7 +3130,9 @@ export class SessionManager implements ISessionManager {
    * Internal: Load messages from disk storage into the managed session.
    */
   private async loadMessagesFromDisk(managed: ManagedSession): Promise<void> {
-    const storedSession = loadStoredSession(managed.workspace.rootPath, managed.id)
+    const storedSession = sessionPersistenceQueue.getLatestSnapshot(managed.id)
+      ?? loadStoredSession(managed.workspace.rootPath, managed.id)
+    if (!storedSession) throw new Error(`Cannot hydrate session ${managed.id}: history unavailable`)
     if (storedSession) {
       managed.messages = (storedSession.messages || []).map(storedToMessage)
       managed.tokenUsage = storedSession.tokenUsage
@@ -3893,6 +3897,7 @@ export class SessionManager implements ISessionManager {
       && managed.messageAccessVersion === accessVersion
       && this.sessions.get(managed.id) === managed
       && this.idleDisposeMs > 0
+      && !this.hasLiveRuntime(managed)
       && now - Math.max(managed.lastMessageAccessAt ?? 0,
         managed.lastRuntimeActivityAt ?? managed.lastMessageAt) >= this.idleDisposeMs
       && !this.getRuntimeBusyReason(managed, now)

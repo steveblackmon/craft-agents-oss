@@ -25,7 +25,7 @@ function harness(toolInput: Record<string, unknown>, toolName = 'mcp__session__b
   manager.sessionActivityListeners = new Map()
   const managed = createManagedSession({ id: 'password-redaction' }, {
     id: 'workspace', slug: 'workspace', name: 'Test', rootPath: '/unused-password-redaction', createdAt: Date.now(),
-  })
+  }, { messagesLoaded: true })
   managed.messages.push({
     id: 'tool-msg', role: 'tool', content: '', timestamp: 1,
     toolName, toolUseId: 'tu-1', toolInput, toolStatus: 'executing',

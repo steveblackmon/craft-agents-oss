@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test'
-import { mkdtempSync, mkdirSync, rmSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, readFileSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { sessionPersistenceQueue } from '@craft-agent/shared/sessions/persistence-queue'
@@ -216,6 +216,58 @@ describe('idle message release', () => {
     ;(sm as any).idleDisposeMs = 0
     await sm.sweepIdleRuntimes()
     expect(m.messagesLoaded).toBe(true)
+  })
+
+  it('fails closed on missing disk history without converting a cold session into an empty loaded session', async () => {
+    await sm.sweepIdleRuntimes()
+    const path = join(root, 'sessions', m.id, 'session.jsonl')
+    const saved = readFileSync(path)
+    rmSync(path)
+    await expect(sm.getSession(m.id)).rejects.toThrow('history unavailable')
+    expect(m.messagesLoaded).toBe(false)
+    expect(() => sm.updateMessageContent(m.id, 'a1', 'edited')).toThrow('history unavailable')
+    await expect(sm.renameSession(m.id, 'renamed')).rejects.toThrow('history unavailable')
+    expect(m.messagesLoaded).toBe(false)
+    expect(sessionPersistenceQueue.hasUnflushed(m.id)).toBe(false)
+    writeFileSync(path, saved)
+    expect((await sm.getSession(m.id))?.messages).toHaveLength(2)
+  })
+
+  it('cold hydration uses an in-flight metadata snapshot and cannot lose history or revert unread metadata', async () => {
+    await sm.sweepIdleRuntimes()
+    const unread = sm.markSessionUnread(m.id)
+    expect(sessionPersistenceQueue.hasUnflushed(m.id)).toBe(true)
+    await sm.renameSession(m.id, 'Renamed during metadata write')
+    await unread
+    await sm.flushSession(m.id)
+    const stored = loadSession(root, m.id)!
+    expect(stored.messages.map(x => x.content)).toEqual(['question', 'answer'])
+    expect(stored.hasUnread).toBe(true)
+    expect(stored.name).toBe('Renamed during metadata write')
+  })
+
+  it('metadata RMW during release cannot replace the fresh snapshot with older disk messages', async () => {
+    await sm.flushSession(m.id)
+    m.messages.push({ id: 'late', role: 'info', content: 'late result', timestamp: 3 })
+    m.hasUnread = true
+    spies.push(spyOn(sm, 'flushSession').mockImplementation(async id => {
+      const write = sessionPersistenceQueue.flush(id)
+      const metadata = sm.markAllSessionsRead('ws')
+      await Promise.all([write, metadata])
+    }))
+    await sm.sweepIdleRuntimes()
+    expect(m.messagesLoaded).toBe(false)
+    const stored = loadSession(root, m.id)!
+    expect(stored.messages.map(x => x.content)).toEqual(['question', 'answer', 'late result'])
+    expect(stored.hasUnread).toBe(false)
+  })
+
+  it('retains messages when runtime disposal fails', async () => {
+    m.agent = { isProcessing: () => false }
+    spies.push(spyOn(sm as any, 'evictManagedRuntime').mockRejectedValue(new Error('dispose failed')))
+    await sm.sweepIdleRuntimes()
+    expect(m.messagesLoaded).toBe(true)
+    m.agent = null
   })
 
   it('queue replay hydrates before finding and clearing queued message flags', async () => {

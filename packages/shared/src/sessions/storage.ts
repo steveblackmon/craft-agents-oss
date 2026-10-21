@@ -556,7 +556,7 @@ export async function updateSessionMetadata(
     | 'projectId'
   >>
 ): Promise<void> {
-  const session = loadSession(workspaceRootPath, sessionId);
+  const session = sessionPersistenceQueue.getLatestSnapshot(sessionId) ?? loadSession(workspaceRootPath, sessionId);
   if (!session) return;
 
   if (updates.isFlagged !== undefined) session.isFlagged = updates.isFlagged;
@@ -687,7 +687,7 @@ export async function setPendingPlanExecution(
   planPath: string,
   draftInputSnapshot?: string,
 ): Promise<void> {
-  const session = loadSession(workspaceRootPath, sessionId);
+  const session = sessionPersistenceQueue.getLatestSnapshot(sessionId) ?? loadSession(workspaceRootPath, sessionId);
   if (!session) return;
 
   session.pendingPlanExecution = {
@@ -708,7 +708,7 @@ export async function markCompactionComplete(
   workspaceRootPath: string,
   sessionId: string
 ): Promise<void> {
-  const session = loadSession(workspaceRootPath, sessionId);
+  const session = sessionPersistenceQueue.getLatestSnapshot(sessionId) ?? loadSession(workspaceRootPath, sessionId);
   if (!session?.pendingPlanExecution) return;
 
   session.pendingPlanExecution.awaitingCompaction = false;
@@ -724,7 +724,7 @@ export async function markPendingPlanExecutionDispatched(
   workspaceRootPath: string,
   sessionId: string
 ): Promise<boolean> {
-  const session = loadSession(workspaceRootPath, sessionId);
+  const session = sessionPersistenceQueue.getLatestSnapshot(sessionId) ?? loadSession(workspaceRootPath, sessionId);
   const pending = session?.pendingPlanExecution;
   if (!session || !pending || pending.awaitingCompaction || pending.executionDispatched) {
     return false;
@@ -744,7 +744,7 @@ export async function clearPendingPlanExecution(
   workspaceRootPath: string,
   sessionId: string
 ): Promise<void> {
-  const session = loadSession(workspaceRootPath, sessionId);
+  const session = sessionPersistenceQueue.getLatestSnapshot(sessionId) ?? loadSession(workspaceRootPath, sessionId);
   // Nothing pending (the common case: this runs on every user message): no rewrite. Rewriting the
   // whole file here raced concurrent sends on the shared .tmp path and could revert newer writes.
   if (!session?.pendingPlanExecution) return;

@@ -30,6 +30,16 @@ The persistence queue serializes timer-started writes as well as explicit flushe
 waits for in-flight writes even when no debounce entry remains, and retains failed
 snapshots for retry. Pending, writing or failed snapshots block history release.
 A failure logs an error; it does not change the historical non-throwing `flush` API.
+Failed writes have no automatic retry timer: the next sweep, explicit flush or
+new enqueue retries them. Cancellation marks in-flight snapshots invalid so a
+failed write cannot requeue deleted history and resurrect it during shutdown.
+
+POSIX writes replace JSONL with an atomic rename (no unlink gap). Cold hydration
+prefers the latest queued/in-flight snapshot, and throws if neither it nor disk
+provides a history; it never marks a missing history loaded. Storage metadata and
+pending-plan read-modify-write helpers also prefer the latest queued snapshot,
+so an old disk read cannot overwrite a newer pre-release message snapshot.
+Release is refused if runtime disposal failed and a live runtime remains.
 
 `getSession`/`sessions:getMessages`, send (including `/compact`), title refresh and
 transfer summaries lazy-load. Queue replay hydrates before looking up queued IDs;
