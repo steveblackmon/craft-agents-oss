@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, spyOn } from 'bun:test'
-import { mkdtempSync, mkdirSync, rmSync } from 'fs'
+import { mkdtempSync, mkdirSync, rmSync, existsSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import { SessionPersistenceQueue } from '../persistence-queue'
@@ -71,6 +71,48 @@ describe('durability gates for history eviction', () => {
     expect(queue.hasUnflushed('history')).toBe(false)
     expect(loadSession(root, 'history')?.messages[0]?.content).toBe('new')
     spy.mockRestore()
+  })
+
+  it('cancel invalidates an in-progress write so shutdown cannot resurrect a deleted session', async () => {
+    queue.enqueue(snapshot())
+    const writing = queue.flush('history') // consumes pending, yields inside writeFile
+    expect(queue.hasPending('history')).toBe(false)
+    queue.cancel('history')
+    rmSync(join(root, 'sessions/history'), { recursive: true, force: true })
+    await writing
+    expect(queue.hasUnflushed('history')).toBe(false)
+    expect(queue.getLatestSnapshot('history')).toBeUndefined()
+    await queue.flushAll()
+    expect(existsSync(join(root, 'sessions/history'))).toBe(false)
+  })
+
+  it('cancel prevents a failed in-flight write from requeueing its snapshot', async () => {
+    const badTmp = join(root, 'sessions/history/session.jsonl.tmp')
+    mkdirSync(badTmp, { recursive: true })
+    const spy = spyOn(console, 'error').mockImplementation(() => {})
+    queue.enqueue(snapshot())
+    const writing = queue.flush('history') // writeFile on a directory will fail
+    queue.cancel('history')
+    await writing
+    expect(queue.hasUnflushed('history')).toBe(false)
+    rmSync(join(root, 'sessions/history'), { recursive: true, force: true })
+    await queue.flushAll()
+    expect(existsSync(join(root, 'sessions/history'))).toBe(false)
+    spy.mockRestore()
+  })
+
+  it('metadata writers can read the latest in-flight snapshot instead of stale disk history', async () => {
+    queue.enqueue(snapshot('old'))
+    await queue.flush('history')
+    queue.enqueue(snapshot('new'))
+    const writing = queue.flush('history')
+    const current = queue.getLatestSnapshot('history')!
+    expect(current.messages[0]?.content).toBe('new')
+    current.name = 'metadata'
+    queue.enqueue(current)
+    await writing
+    expect(loadSession(root, 'history')?.messages[0]?.content).toBe('new')
+    expect(loadSession(root, 'history')?.name).toBe('metadata')
   })
 
   it('retains failed snapshots until a successful retry', async () => {

@@ -8,6 +8,7 @@ import { debug } from '../utils/debug.js'
 
 interface PendingWrite {
   data: StoredSession
+  cancelled?: boolean
   timer: ReturnType<typeof setTimeout>
 }
 
@@ -58,6 +59,7 @@ function mergeHeaderWithExternalMetadata(localHeader: SessionHeader, diskHeader:
  */
 class SessionPersistenceQueue {
   private pending = new Map<string, PendingWrite>()
+  private activeEntries = new Map<string, PendingWrite>()
   private writeInProgress = new Map<string, Promise<boolean>>()
   private lastWrittenHeaderSignature = new Map<string, string>()
   private debounceMs: number
@@ -93,6 +95,7 @@ class SessionPersistenceQueue {
 
     this.pending.delete(sessionId)
     clearTimeout(entry.timer)
+    this.activeEntries.set(sessionId, entry)
 
     try {
       const { data } = entry
@@ -157,17 +160,29 @@ class SessionPersistenceQueue {
 
       const tmpFile = filePath + '.tmp'
       await writeFile(tmpFile, lines.join('\n') + '\n', 'utf-8')
-      // On Windows, rename fails if target exists. Delete first for cross-platform compatibility.
-      try { await unlink(filePath) } catch { /* ignore if doesn't exist */ }
-      await rename(tmpFile, filePath)
+      if (entry.cancelled) return false
+      // POSIX rename replaces atomically: readers must never see a missing file.
+      try {
+        await rename(tmpFile, filePath)
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (process.platform !== 'win32' || (code !== 'EEXIST' && code !== 'EPERM')) throw error
+        // Compatibility fallback only on platforms that cannot replace a file.
+        if (entry.cancelled) return false
+        await unlink(filePath)
+        if (entry.cancelled) return false
+        await rename(tmpFile, filePath)
+      }
       debug(`[PersistenceQueue] Wrote session ${sessionId}`)
       return true
     } catch (error) {
       // Retain the snapshot for retry. An eviction must never mistake a failed
       // write for a durable history. A newer queued snapshot takes precedence.
-      if (!this.pending.has(sessionId)) this.pending.set(sessionId, entry)
+      if (!entry.cancelled && !this.pending.has(sessionId)) this.pending.set(sessionId, entry)
       console.error(`[PersistenceQueue] Failed to write session ${sessionId}:`, error)
       return false
+    } finally {
+      if (this.activeEntries.get(sessionId) === entry) this.activeEntries.delete(sessionId)
     }
   }
 
@@ -206,6 +221,8 @@ class SessionPersistenceQueue {
    * Cancel a pending write for a session (e.g., when deleting the session).
    */
   cancel(sessionId: string): void {
+    const active = this.activeEntries.get(sessionId)
+    if (active) active.cancelled = true
     const entry = this.pending.get(sessionId)
     if (entry) {
       clearTimeout(entry.timer)
@@ -228,6 +245,16 @@ class SessionPersistenceQueue {
    */
   hasPending(sessionId: string): boolean {
     return this.pending.has(sessionId)
+  }
+
+  /** Latest whole-history snapshot for synchronous read-modify-write callers.
+   * Prefer queued/in-flight state to disk, which may still contain an older
+   * history. Return a new top-level object so metadata edits cannot mutate a
+   * snapshot whose serialization has already started.
+   */
+  getLatestSnapshot(sessionId: string): StoredSession | undefined {
+    const entry = this.pending.get(sessionId) ?? this.activeEntries.get(sessionId)
+    return entry && !entry.cancelled ? { ...entry.data } : undefined
   }
 
   /** Pending, failed (retained for retry), or currently writing to disk. */
