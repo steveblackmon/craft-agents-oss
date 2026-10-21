@@ -36,7 +36,10 @@ failed write cannot requeue deleted history and resurrect it during shutdown.
 
 POSIX writes replace JSONL with an atomic rename (no unlink gap). Cold hydration
 prefers the latest queued/in-flight snapshot, and throws if neither it nor disk
-provides a history; it never marks a missing history loaded. Storage metadata and
+provides a history; it never marks a missing released history loaded. The only missing-file
+exception is a never-released, explicitly zero-count, empty session with no SDK
+session ID; genuinely new sessions can initialize empty. Unknown counts and
+released sessions (even with a stale zero header count) still fail closed. Storage metadata and
 pending-plan read-modify-write helpers also prefer the latest queued snapshot,
 so an old disk read cannot overwrite a newer pre-release message snapshot.
 Release is refused if runtime disposal failed and a live runtime remains.

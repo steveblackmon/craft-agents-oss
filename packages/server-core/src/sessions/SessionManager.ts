@@ -877,6 +877,8 @@ interface ManagedSession {
   backgroundTaskRegistry: Map<string, RunningBackgroundTask>
   // Whether messages have been loaded from disk (for lazy loading)
   messagesLoaded: boolean
+  /** Once released, a missing history is never treated as a new empty session. */
+  messagesReleased?: boolean
   // Pending auth request tracking (for unified auth flow)
   pendingAuthRequestId?: string
   pendingAuthRequest?: AuthRequest
@@ -2610,6 +2612,14 @@ export class SessionManager implements ISessionManager {
     this.enqueuePersist(managed)
   }
 
+  private canInitializeEmptyHistory(managed: ManagedSession): boolean {
+    return managed.messageCount === 0
+      && !managed.messagesReleased
+      && managed.messages.length === 0
+      && !managed.sdkSessionId
+      && !existsSync(getSessionFilePath(managed.workspace.rootPath, managed.id))
+  }
+
   // Cold-persist hydration. Mirrors the messages/queue-recovery half of
   // loadMessagesFromDisk but skips the metadata field syncs. Sets
   // messagesLoaded=true so subsequent persistSession calls take the fast path.
@@ -2621,7 +2631,9 @@ export class SessionManager implements ISessionManager {
     sessionLog.debug(`Cold-load triggered for persistSession on ${managed.id}`)
     const stored = sessionPersistenceQueue.getLatestSnapshot(managed.id)
       ?? loadStoredSession(managed.workspace.rootPath, managed.id)
-    if (!stored) throw new Error(`Cannot hydrate session ${managed.id}: history unavailable`)
+    if (!stored && !this.canInitializeEmptyHistory(managed)) {
+      throw new Error(`Cannot hydrate session ${managed.id}: history unavailable`)
+    }
     if (stored) {
       managed.messages = (stored.messages || []).map(storedToMessage)
       managed.tokenUsage = stored.tokenUsage
@@ -3132,7 +3144,9 @@ export class SessionManager implements ISessionManager {
   private async loadMessagesFromDisk(managed: ManagedSession): Promise<void> {
     const storedSession = sessionPersistenceQueue.getLatestSnapshot(managed.id)
       ?? loadStoredSession(managed.workspace.rootPath, managed.id)
-    if (!storedSession) throw new Error(`Cannot hydrate session ${managed.id}: history unavailable`)
+    if (!storedSession && !this.canInitializeEmptyHistory(managed)) {
+      throw new Error(`Cannot hydrate session ${managed.id}: history unavailable`)
+    }
     if (storedSession) {
       managed.messages = (storedSession.messages || []).map(storedToMessage)
       managed.tokenUsage = storedSession.tokenUsage
@@ -3913,6 +3927,7 @@ export class SessionManager implements ISessionManager {
     const count = managed.messages.length
     managed.messages = []
     managed.messagesLoaded = false
+    managed.messagesReleased = true
     sessionLog.info(`Released ${count} messages for idle session ${managed.id}`)
     return true
   }
