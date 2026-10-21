@@ -33,6 +33,8 @@ A failure logs an error; it does not change the historical non-throwing `flush` 
 Failed writes have no automatic retry timer: the next sweep, explicit flush or
 new enqueue retries them. Cancellation marks in-flight snapshots invalid so a
 failed write cannot requeue deleted history and resurrect it during shutdown.
+Flush distinguishes cancellation from failure and continues draining replacement
+snapshots queued behind a cancelled write, even if their timer already fired.
 
 POSIX writes replace JSONL with an atomic rename (no unlink gap). Cold hydration
 prefers the latest queued/in-flight snapshot, and throws if neither it nor disk
