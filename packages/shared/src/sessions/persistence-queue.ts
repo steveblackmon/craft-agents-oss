@@ -6,8 +6,11 @@ import { toPortablePath } from '../utils/paths.js'
 import { createSessionHeader, makeSessionPathPortable, readSessionHeader } from './jsonl.js'
 import { debug } from '../utils/debug.js'
 
+type WriteResult = 'written' | 'failed' | 'cancelled'
+
 interface PendingWrite {
   data: StoredSession
+  cancelled?: boolean
   timer: ReturnType<typeof setTimeout>
 }
 
@@ -58,7 +61,8 @@ function mergeHeaderWithExternalMetadata(localHeader: SessionHeader, diskHeader:
  */
 class SessionPersistenceQueue {
   private pending = new Map<string, PendingWrite>()
-  private writeInProgress = new Map<string, Promise<void>>()
+  private activeEntries = new Map<string, PendingWrite>()
+  private writeInProgress = new Map<string, Promise<WriteResult>>()
   private lastWrittenHeaderSignature = new Map<string, string>()
   private debounceMs: number
 
@@ -77,7 +81,7 @@ class SessionPersistenceQueue {
     }
 
     const timer = setTimeout(() => {
-      void this.write(session.id)
+      void this.flush(session.id)
     }, this.debounceMs)
 
     this.pending.set(session.id, { data: session, timer })
@@ -87,11 +91,13 @@ class SessionPersistenceQueue {
    * Write a session to disk immediately in JSONL format.
    * Uses atomic write (write-to-temp-then-rename) to prevent corruption on crash.
    */
-  private async write(sessionId: string): Promise<void> {
+  private async write(sessionId: string): Promise<WriteResult> {
     const entry = this.pending.get(sessionId)
-    if (!entry) return
+    if (!entry) return 'written'
 
     this.pending.delete(sessionId)
+    clearTimeout(entry.timer)
+    this.activeEntries.set(sessionId, entry)
 
     try {
       const { data } = entry
@@ -156,12 +162,30 @@ class SessionPersistenceQueue {
 
       const tmpFile = filePath + '.tmp'
       await writeFile(tmpFile, lines.join('\n') + '\n', 'utf-8')
-      // On Windows, rename fails if target exists. Delete first for cross-platform compatibility.
-      try { await unlink(filePath) } catch { /* ignore if doesn't exist */ }
-      await rename(tmpFile, filePath)
+      if (entry.cancelled) return 'cancelled'
+      // POSIX rename replaces atomically: readers must never see a missing file.
+      try {
+        await rename(tmpFile, filePath)
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code
+        if (process.platform !== 'win32' || (code !== 'EEXIST' && code !== 'EPERM')) throw error
+        // Compatibility fallback only on platforms that cannot replace a file.
+        if (entry.cancelled) return 'cancelled'
+        await unlink(filePath)
+        if (entry.cancelled) return 'cancelled'
+        await rename(tmpFile, filePath)
+      }
       debug(`[PersistenceQueue] Wrote session ${sessionId}`)
+      return 'written'
     } catch (error) {
+      // Retain the snapshot for retry. An eviction must never mistake a failed
+      // write for a durable history. A newer queued snapshot takes precedence.
+      if (entry.cancelled) return 'cancelled'
+      if (!this.pending.has(sessionId)) this.pending.set(sessionId, entry)
       console.error(`[PersistenceQueue] Failed to write session ${sessionId}:`, error)
+      return 'failed'
+    } finally {
+      if (this.activeEntries.get(sessionId) === entry) this.activeEntries.delete(sessionId)
     }
   }
 
@@ -171,25 +195,29 @@ class SessionPersistenceQueue {
    * to prevent race conditions on the shared .tmp file.
    */
   async flush(sessionId: string): Promise<void> {
-    const entry = this.pending.get(sessionId)
-    if (entry) {
-      clearTimeout(entry.timer)
-
-      // Wait for any in-progress write to complete first
+    // Includes timer-started writes, not just explicit flushes. Install the
+    // promise before yielding so concurrent flushes serialize on the same file.
+    // Cancellation invalidates only that snapshot, not a newer enqueue behind it.
+    while (true) {
       const inProgress = this.writeInProgress.get(sessionId)
       if (inProgress) {
-        await inProgress
+        // A failed write is retained, but retry only on the next flush call.
+        if (await inProgress === 'failed') return
+        continue
       }
-
-      // Start new write and track it
+      if (!this.pending.has(sessionId)) return
       const writePromise = this.write(sessionId)
       this.writeInProgress.set(sessionId, writePromise)
-
+      let result: WriteResult
       try {
-        await writePromise
+        result = await writePromise
       } finally {
-        this.writeInProgress.delete(sessionId)
+        if (this.writeInProgress.get(sessionId) === writePromise) {
+          this.writeInProgress.delete(sessionId)
+        }
       }
+      // Drain newer snapshots too; stop on failure rather than retrying forever.
+      if (result === 'failed') return
     }
   }
 
@@ -197,6 +225,8 @@ class SessionPersistenceQueue {
    * Cancel a pending write for a session (e.g., when deleting the session).
    */
   cancel(sessionId: string): void {
+    const active = this.activeEntries.get(sessionId)
+    if (active) active.cancelled = true
     const entry = this.pending.get(sessionId)
     if (entry) {
       clearTimeout(entry.timer)
@@ -210,7 +240,7 @@ class SessionPersistenceQueue {
    * Flush all pending sessions. Call this on app quit.
    */
   async flushAll(): Promise<void> {
-    const sessionIds = [...this.pending.keys()]
+    const sessionIds = [...new Set([...this.pending.keys(), ...this.writeInProgress.keys()])]
     await Promise.all(sessionIds.map(id => this.flush(id)))
   }
 
@@ -219,6 +249,22 @@ class SessionPersistenceQueue {
    */
   hasPending(sessionId: string): boolean {
     return this.pending.has(sessionId)
+  }
+
+  /** Latest whole-history snapshot for synchronous read-modify-write callers.
+   * Prefer queued/in-flight state to disk, which may still contain an older
+   * history. Return a new top-level object so metadata edits cannot mutate a
+   * snapshot whose serialization has already started. Nested messages and plan
+   * state remain shared; this is not a deep clone.
+   */
+  getLatestSnapshot(sessionId: string): StoredSession | undefined {
+    const entry = this.pending.get(sessionId) ?? this.activeEntries.get(sessionId)
+    return entry && !entry.cancelled ? { ...entry.data } : undefined
+  }
+
+  /** Pending, failed (retained for retry), or currently writing to disk. */
+  hasUnflushed(sessionId: string): boolean {
+    return this.pending.has(sessionId) || this.writeInProgress.has(sessionId)
   }
 
   /**

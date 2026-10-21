@@ -26,7 +26,7 @@ function harness() {
   manager.monotonic = () => Date.now()
   const managed = createManagedSession({ id: 'retry-test' }, {
     id: 'workspace', slug: 'workspace', name: 'Test', rootPath: '/unused-retry-test', createdAt: Date.now(),
-  })
+  }, { messagesLoaded: true })
   return { manager, managed, events, fire: (event: AgentEvent) => manager.processEvent(managed, event) }
 }
 
