@@ -78,3 +78,32 @@ describe('McpClientPool.ensureConnected', () => {
     }
   });
 });
+
+describe('McpClientPool concurrent connects', () => {
+  test('a connect that loses the race neither replaces the client nor records its config', async () => {
+    const closed: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>(r => { release = r; });
+    class RacePool extends McpClientPool {
+      override async connect(slug: string, config: SdkMcpServerConfig): Promise<void> {
+        const token = (config as { headers?: Record<string, string> }).headers?.Authorization ?? '';
+        const fake: PoolClient = {
+          // The first (old-token) connect answers first; the second waits.
+          listTools: async () => { if (token.endsWith('b')) await gate; return []; },
+          callTool: async () => ({ content: [] }),
+          close: async () => { closed.push(token); },
+        };
+        if (await this.registerClient(slug, fake)) this.activeConfigs.set(slug, config);
+      }
+      configOf(slug: string) { return this.activeConfigs.get(slug); }
+    }
+    const pool = new RacePool();
+    const second = pool.connect('craft', httpConfig('b'));
+    await pool.connect('craft', httpConfig('a'));
+    release();
+    await second;
+    expect(closed).toEqual(['Bearer b']);
+    expect(pool.configOf('craft')).toEqual(httpConfig('a'));
+  });
+});
+
