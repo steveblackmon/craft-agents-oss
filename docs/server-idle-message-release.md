@@ -21,7 +21,8 @@ hydrates the history using the existing cold-session path.
 
 ## Durability and readers
 
-Before release, flush the persistence queue, then synchronously recheck activity,
+Before release, enqueue a fresh history snapshot (including any unqueued late
+notifications), flush the persistence queue, then synchronously recheck activity,
 viewing, loading, busy state and unflushed writes. An access generation prevents a
 same-tick reader from losing its history during the asynchronous flush.
 

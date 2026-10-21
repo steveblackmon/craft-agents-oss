@@ -2664,7 +2664,7 @@ export class SessionManager implements ISessionManager {
 
   // Build the StoredSession snapshot and hand it to the persistence queue.
   // Caller must ensure `managed.messagesLoaded` is true.
-  private enqueuePersist(managed: ManagedSession): void {
+  private enqueuePersist(managed: ManagedSession): boolean {
     try {
       // Filter out transient status messages (progress indicators like "Compacting...")
       // Error messages are now persisted with rich fields for diagnostics
@@ -2683,8 +2683,10 @@ export class SessionManager implements ISessionManager {
 
       // Queue for async persistence with debouncing
       sessionPersistenceQueue.enqueue(storedSession)
+      return true
     } catch (error) {
       sessionLog.error(`Failed to queue session ${managed.id} for persistence:`, error)
+      return false
     }
   }
 
@@ -3898,6 +3900,9 @@ export class SessionManager implements ISessionManager {
       && !managed.isAsyncOperationOngoing
       && !this.messageLoadingPromises.has(managed.id)
     if (!canRelease()) return false
+    // Snapshot even unqueued late notifications before releasing. This writes
+    // once per idle release, avoiding a second dirty-state bookkeeping system.
+    if (!this.enqueuePersist(managed)) return false
     await this.flushSession(managed.id)
     if (!canRelease() || sessionPersistenceQueue.hasUnflushed(managed.id)) return false
     const count = managed.messages.length
