@@ -190,7 +190,7 @@ describe('shared stdio children', () => {
     expect(registry.stats()[0]).toEqual(expect.objectContaining({ refs: 2, spawns: 2 }));
   });
 
-  test('config change retires the old child; other sessions migrate on next call', async () => {
+  test('config change: each session moves to the new child on its own reload; old child reaped with its last lease', async () => {
     const p1 = newPool();
     const p2 = newPool();
     await p1.sync({ pidsrc: stdio('a') });
@@ -203,14 +203,40 @@ describe('shared stdio children', () => {
     const fresh = await pidOf(p1);
     expect(fresh.tag).toBe('b');
     expect(fresh.pid).not.toBe(old.pid);
-    expect(alive(old.pid)).toBe(true); // session 2 still holds it
 
-    // Session 2 has not reloaded: its next call migrates to the new child
-    const migrated = await pidOf(p2);
-    expect(migrated.pid).toBe(fresh.pid);
-    expect(migrated.tag).toBe('b');
+    // Session 2 has not reloaded yet (e.g. mid-turn): it keeps its child, untouched
+    expect(await pidOf(p2)).toEqual(old);
+    expect(alive(old.pid)).toBe(true);
+
+    // Its reload moves it over and the old child goes with its last lease
+    await p2.sync({ pidsrc: stdio('b') });
+    expect((await pidOf(p2)).pid).toBe(fresh.pid);
     await waitFor(() => !alive(old.pid));
-    expect(registry.stats()).toEqual([expect.objectContaining({ refs: 2, superseded: false })]);
+    expect(registry.stats()).toEqual([expect.objectContaining({ refs: 2, pid: fresh.pid })]);
+  });
+
+  test('config change in another session does not interrupt an in-flight call', async () => {
+    const p1 = newPool();
+    const p2 = newPool();
+    await p1.sync({ pidsrc: stdio('a') });
+    await p2.sync({ pidsrc: stdio('a') });
+    const inFlight = pidOf(p1);
+    await p2.sync({ pidsrc: stdio('b') });
+    const [a, again] = await Promise.all([inFlight, pidOf(p1)]);
+    expect(a.tag).toBe('a');
+    expect(again.pid).toBe(a.pid);
+  });
+
+  test('capabilities survive a crash, so feature checks pass before the respawn', async () => {
+    const p1 = newPool();
+    await p1.sync({ pidsrc: stdio() });
+    const lease = registry.acquire(WS, 'pidsrc', { transport: 'stdio', command: 'node', args: [FIXTURE], env: { FIXTURE_TAG: 'a' } });
+    expect(lease.getServerCapabilities()).toEqual(expect.objectContaining({ tools: {} }));
+    const { pid } = await pidOf(p1);
+    process.kill(pid, 'SIGKILL');
+    await waitFor(() => registry.stats()[0]?.pid === null);
+    expect(lease.getServerCapabilities()).toEqual(expect.objectContaining({ tools: {} }));
+    await lease.close();
   });
 
   test('disposed mid-connect: the connect releases its lease (no leaked child)', async () => {

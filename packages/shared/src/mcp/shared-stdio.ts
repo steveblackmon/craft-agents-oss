@@ -18,8 +18,11 @@
  * - A child that exits is dropped; the next call from any lease respawns it
  *   (single in-flight connect, lazy so a crash loop cannot spin).
  * - A new config for the same workspace + slug (credential rotation, edited
- *   config.json) supersedes older entries: their leases migrate on next use
- *   and the old child is reaped when its last lease goes.
+ *   config.json) hashes to a new entry, so it gets a new child. Each session
+ *   moves over when its source reload sees the changed config
+ *   (mcpConfigChanged), and the old child is reaped with its last lease.
+ *   Leases never switch children by themselves: that could close a child
+ *   under the session's own in-flight call, or follow a config that failed.
  *
  * Env knobs (read at use time, no rebuild needed):
  *   CRAFT_SHARED_MCP=1                 enable sharing
@@ -82,17 +85,17 @@ const defaultFactory: SharedChildFactory = (config, onClose) =>
 
 interface Entry {
   key: string;
-  /** workspaceRootPath + slug: entries of one family supersede each other */
-  family: string;
   slug: string;
   config: StdioMcpClientConfig;
   child: SharedChild | null;
   connecting: Promise<SharedChild> | null;
   refs: number;
   lingerTimer: ReturnType<typeof setTimeout> | null;
-  superseded: boolean;
   closed: boolean;
   spawns: number;
+  /** Last known handshake data, kept across a crash so feature checks still pass before respawn */
+  capabilities?: ServerCapabilities;
+  instructions?: string;
 }
 
 export interface SharedStdioEntryStats {
@@ -101,14 +104,11 @@ export interface SharedStdioEntryStats {
   refs: number;
   pid: number | null;
   spawns: number;
-  superseded: boolean;
   lingering: boolean;
 }
 
 export class SharedStdioMcpRegistry {
   private entries = new Map<string, Entry>();
-  /** Newest config seen per family (workspace + slug) */
-  private latest = new Map<string, { key: string; config: StdioMcpClientConfig }>();
   private factory: SharedChildFactory;
   private lingerMs: () => number;
   private log: (msg: string) => void;
@@ -138,43 +138,28 @@ export class SharedStdioMcpRegistry {
       refs: e.refs,
       pid: e.child?.getPid?.() ?? null,
       spawns: e.spawns,
-      superseded: e.superseded,
       lingering: e.lingerTimer !== null,
     }));
   }
 
   /** @internal */
   retain(workspaceRootPath: string, slug: string, config: StdioMcpClientConfig): Entry {
-    const family = `${workspaceRootPath}\u0000${slug}`;
-    const key = `${family}#${stdioConfigHash(config)}`;
+    const key = `${workspaceRootPath}\u0000${slug}#${stdioConfigHash(config)}`;
     let entry = this.entries.get(key);
     if (entry) {
       if (entry.lingerTimer) {
         clearTimeout(entry.lingerTimer);
         entry.lingerTimer = null;
       }
-      entry.superseded = false;
     } else {
       entry = {
-        key, family, slug, config,
+        key, slug, config,
         child: null, connecting: null, refs: 0, lingerTimer: null,
-        superseded: false, closed: false, spawns: 0,
+        closed: false, spawns: 0,
       };
       this.entries.set(key, entry);
     }
     entry.refs++;
-
-    // The newest config wins: older children of this source are retired.
-    const prev = this.latest.get(family);
-    if (prev?.key !== key) {
-      this.latest.set(family, { key, config });
-      for (const other of this.entries.values()) {
-        if (other.family !== family || other === entry || other.superseded) continue;
-        other.superseded = true;
-        this.log(`${slug}: config changed, retiring child (refs=${other.refs})`);
-        if (other.refs === 0) void this.closeEntry(other);
-      }
-    }
     return entry;
   }
 
@@ -182,7 +167,7 @@ export class SharedStdioMcpRegistry {
   release(entry: Entry): void {
     entry.refs = Math.max(0, entry.refs - 1);
     if (entry.refs > 0 || entry.closed) return;
-    const linger = entry.superseded ? 0 : this.lingerMs();
+    const linger = this.lingerMs();
     if (linger <= 0) {
       void this.closeEntry(entry);
       return;
@@ -193,21 +178,6 @@ export class SharedStdioMcpRegistry {
       void this.closeEntry(entry);
     }, linger);
     entry.lingerTimer.unref?.();
-  }
-
-  /** @internal The newest config for the entry's family, if it is not this entry. */
-  successor(entry: Entry): { workspaceAndSlug: string; config: StdioMcpClientConfig } | null {
-    const latest = this.latest.get(entry.family);
-    if (!latest || latest.key === entry.key) return null;
-    return { workspaceAndSlug: entry.family, config: latest.config };
-  }
-
-  /** @internal Re-take a ref on the newest config of this family (lease migration). */
-  retainSuccessor(entry: Entry): Entry | null {
-    const next = this.successor(entry);
-    if (!next) return null;
-    const sep = next.workspaceAndSlug.indexOf('\u0000');
-    return this.retain(next.workspaceAndSlug.slice(0, sep), next.workspaceAndSlug.slice(sep + 1), next.config);
   }
 
   /** @internal A connected child for the entry, spawning one if needed. */
@@ -239,6 +209,8 @@ export class SharedStdioMcpRegistry {
       }
       entry.child = child;
       entry.spawns++;
+      entry.capabilities = child.getServerCapabilities?.();
+      entry.instructions = child.getInstructions?.();
       this.log(`${entry.slug}: spawned shared child pid=${child.getPid?.() ?? '?'} (refs=${entry.refs}, spawns=${entry.spawns})`);
       return child;
     })();
@@ -259,11 +231,6 @@ export class SharedStdioMcpRegistry {
       entry.lingerTimer = null;
     }
     if (this.entries.get(entry.key) === entry) this.entries.delete(entry.key);
-    if (this.latest.get(entry.family)?.key === entry.key) {
-      // Keep the family's newest config only while some entry still uses it.
-      const stillUsed = [...this.entries.values()].some(e => e.family === entry.family);
-      if (!stillUsed) this.latest.delete(entry.family);
-    }
     const child = entry.child;
     entry.child = null;
     const pid = child?.getPid?.() ?? null;
@@ -279,7 +246,6 @@ export class SharedStdioMcpRegistry {
     const all = [...this.entries.values()];
     for (const e of all) e.refs = 0;
     await Promise.all(all.map(e => this.closeEntry(e)));
-    this.latest.clear();
   }
 }
 
@@ -290,18 +256,10 @@ export class SharedStdioMcpRegistry {
 export class SharedStdioLease implements PoolClient {
   private released = false;
 
-  constructor(private registry: SharedStdioMcpRegistry, private entry: Entry) {}
+  constructor(private registry: SharedStdioMcpRegistry, private readonly entry: Entry) {}
 
   private async child(): Promise<SharedChild> {
     if (this.released) throw new Error(`MCP source "${this.entry.slug}" lease was released`);
-    if (this.entry.superseded) {
-      const next = this.registry.retainSuccessor(this.entry);
-      if (next) {
-        const old = this.entry;
-        this.entry = next;
-        this.registry.release(old);
-      }
-    }
     return this.registry.ensureChild(this.entry);
   }
 
@@ -318,11 +276,11 @@ export class SharedStdioLease implements PoolClient {
   }
 
   getServerCapabilities(): ServerCapabilities | undefined {
-    return this.entry.child?.getServerCapabilities?.();
+    return this.entry.child?.getServerCapabilities?.() ?? this.entry.capabilities;
   }
 
   getInstructions(): string | undefined {
-    return this.entry.child?.getInstructions?.();
+    return this.entry.child?.getInstructions?.() ?? this.entry.instructions;
   }
 
   async listResources(cursor?: string, options?: PoolRequestOptions): Promise<ListResourcesResult> {

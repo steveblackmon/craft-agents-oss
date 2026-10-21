@@ -274,8 +274,10 @@ export class McpClientPool {
   /**
    * Register a client: connect, cache tools, build proxy mappings.
    * Shared logic for both remote MCP and in-process API sources.
+   * Resolves false (and closes `client`) when a concurrent connect for the
+   * same slug registered first.
    */
-  protected async registerClient(slug: string, client: PoolClient, generation = this.generation): Promise<void> {
+  protected async registerClient(slug: string, client: PoolClient, generation = this.generation): Promise<boolean> {
     // listTools() triggers connect() internally for both CraftMcpClient and ApiSourcePoolClient
     let tools: Tool[];
     try {
@@ -292,7 +294,7 @@ export class McpClientPool {
     if (this.clients.has(slug)) {
       // A concurrent connect for the same slug won the race; keep the first.
       await client.close().catch(() => {});
-      return;
+      return false;
     }
     this.clients.set(slug, client);
     this.toolCache.set(slug, tools);
@@ -327,6 +329,7 @@ export class McpClientPool {
     this.featureProbes.set(slug, probe);
 
     this.debug(`Connected source ${slug}: ${tools.length} tools`);
+    return true;
   }
 
   /** Resolves once the source's feature probe (started at connect) has finished. */
@@ -386,8 +389,9 @@ export class McpClientPool {
     const client = clientConfig.transport === 'stdio' && isSharedStdioEnabled(slug)
       ? this.sharedStdio.acquire(this.workspaceRootPath ?? '', slug, clientConfig)
       : new CraftMcpClient(clientConfig);
-    await this.registerClient(slug, client, generation);
-    this.activeConfigs.set(slug, config);
+    // Record the config only for the client that registered, so a lost race
+    // cannot claim a config (e.g. a newer token) the pool is not running.
+    if (await this.registerClient(slug, client, generation)) this.activeConfigs.set(slug, config);
   }
 
   /**
