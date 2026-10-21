@@ -22,6 +22,7 @@ import {
 } from './client.ts';
 import { ApiSourcePoolClient } from './api-source-pool-client.ts';
 import { proxyToolName } from './proxy-tool-name.ts';
+import { isSharedStdioEnabled, sharedStdioMcp, stdioConfigHash, type SharedStdioMcpRegistry } from './shared-stdio.ts';
 import type { SdkMcpServerConfig } from '../agent/backend/types.ts';
 import type { ContentBlock, Prompt, Resource, ResourceTemplate, Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -179,10 +180,16 @@ function sdkConfigToClientConfig(config: SdkMcpServerConfig): McpClientConfig | 
 /**
  * Check if an MCP source's config has changed in a way that requires reconnection.
  * Compares auth headers (token refresh) and URL changes.
- * Ignores stdio sources since they don't use OAuth tokens.
+ * Stdio sources are compared (command, args, env) only when they use a shared
+ * child (#97), so an edited config.json or rotated credential retires the
+ * shared child; per-session stdio children keep the old behavior.
  */
-function mcpConfigChanged(oldConfig: SdkMcpServerConfig, newConfig: SdkMcpServerConfig): boolean {
+function mcpConfigChanged(slug: string, oldConfig: SdkMcpServerConfig, newConfig: SdkMcpServerConfig): boolean {
   if (oldConfig.type !== newConfig.type) return true;
+
+  if (oldConfig.type === 'stdio' && newConfig.type === 'stdio' && isSharedStdioEnabled(slug)) {
+    return stdioConfigHash(oldConfig) !== stdioConfigHash(newConfig);
+  }
 
   if (
     (oldConfig.type === 'http' || oldConfig.type === 'sse') &&
@@ -231,10 +238,21 @@ export class McpClientPool {
   /** Called after sync() connects/disconnects sources, so clients can be notified */
   onToolsChanged?: () => void;
 
-  constructor(options?: { debug?: (msg: string) => void; workspaceRootPath?: string; sessionPath?: string }) {
+  /** Shared stdio children (#97), used when CRAFT_SHARED_MCP=1 */
+  private sharedStdio: SharedStdioMcpRegistry;
+
+  /**
+   * Bumped by disconnectAll(). A connect that completes into an older
+   * generation closes its client instead of registering it, so a session
+   * disposed mid-connect (e.g. by idle eviction) does not leak the child.
+   */
+  private generation = 0;
+
+  constructor(options?: { debug?: (msg: string) => void; workspaceRootPath?: string; sessionPath?: string; sharedStdio?: SharedStdioMcpRegistry }) {
     this.debugFn = options?.debug;
     this.workspaceRootPath = options?.workspaceRootPath;
     this.sessionPath = options?.sessionPath;
+    this.sharedStdio = options?.sharedStdio ?? sharedStdioMcp;
   }
 
   /**
@@ -257,9 +275,25 @@ export class McpClientPool {
    * Register a client: connect, cache tools, build proxy mappings.
    * Shared logic for both remote MCP and in-process API sources.
    */
-  protected async registerClient(slug: string, client: PoolClient): Promise<void> {
+  protected async registerClient(slug: string, client: PoolClient, generation = this.generation): Promise<void> {
     // listTools() triggers connect() internally for both CraftMcpClient and ApiSourcePoolClient
-    const tools = await client.listTools();
+    let tools: Tool[];
+    try {
+      tools = await client.listTools();
+    } catch (error) {
+      // Release what the failed connect holds (a shared stdio lease pins its child)
+      await client.close().catch(() => {});
+      throw error;
+    }
+    if (generation !== this.generation) {
+      await client.close().catch(() => {});
+      throw new Error(`Source "${slug}" was disconnected while connecting`);
+    }
+    if (this.clients.has(slug)) {
+      // A concurrent connect for the same slug won the race; keep the first.
+      await client.close().catch(() => {});
+      return;
+    }
     this.clients.set(slug, client);
     this.toolCache.set(slug, tools);
 
@@ -342,23 +376,26 @@ export class McpClientPool {
    * Connect to an MCP source server (remote HTTP/SSE/stdio).
    * If already connected, this is a no-op.
    */
-  async connect(slug: string, config: SdkMcpServerConfig): Promise<void> {
+  async connect(slug: string, config: SdkMcpServerConfig, generation = this.generation): Promise<void> {
     if (this.clients.has(slug)) return;
     const clientConfig = sdkConfigToClientConfig(config);
     if (!clientConfig) {
       this.debug(`Unknown MCP server type for ${slug}: ${(config as { type: string }).type}`);
       return;
     }
-    await this.registerClient(slug, new CraftMcpClient(clientConfig));
+    const client = clientConfig.transport === 'stdio' && isSharedStdioEnabled(slug)
+      ? this.sharedStdio.acquire(this.workspaceRootPath ?? '', slug, clientConfig)
+      : new CraftMcpClient(clientConfig);
+    await this.registerClient(slug, client, generation);
     this.activeConfigs.set(slug, config);
   }
 
   /**
    * Connect to an in-process MCP server (API source) via in-memory transport.
    */
-  async connectInProcess(slug: string, mcpServer: McpServer): Promise<void> {
+  async connectInProcess(slug: string, mcpServer: McpServer, generation = this.generation): Promise<void> {
     if (this.clients.has(slug)) return;
-    await this.registerClient(slug, new ApiSourcePoolClient(mcpServer));
+    await this.registerClient(slug, new ApiSourcePoolClient(mcpServer), generation);
   }
 
   /**
@@ -378,7 +415,7 @@ export class McpClientPool {
 
     if (this.clients.has(slug)) {
       const oldConfig = this.activeConfigs.get(slug);
-      if (!oldConfig || !mcpConfigChanged(oldConfig, config)) return;
+      if (!oldConfig || !mcpConfigChanged(slug, oldConfig, config)) return;
       this.debug(`Config changed for ${slug}, reconnecting with fresh credentials`);
       await this.disconnect(slug);
     }
@@ -410,6 +447,7 @@ export class McpClientPool {
    * Disconnect all sources and clear all state.
    */
   async disconnectAll(): Promise<void> {
+    this.generation++;
     const closePromises = Array.from(this.clients.values()).map(c => c.close().catch(() => {}));
     await Promise.all(closePromises);
     this.clients.clear();
@@ -436,6 +474,8 @@ export class McpClientPool {
     mcpServers: Record<string, SdkMcpServerConfig>,
     apiServers: Record<string, ApiServerConfig> = {}
   ): Promise<string[]> {
+    // A disconnectAll() during this sync makes its connects close instead of register.
+    const generation = this.generation;
     // Filter out stdio sources when local MCP is disabled for this workspace.
     const localEnabled = !this.workspaceRootPath || isLocalMcpEnabled(this.workspaceRootPath);
     const filteredMcp: Record<string, SdkMcpServerConfig> = {};
@@ -471,20 +511,20 @@ export class McpClientPool {
 
     for (const [slug, config] of Object.entries(filteredMcp)) {
       if (!currentSlugs.has(slug)) {
-        toConnect.push({ slug, connectFn: () => this.connect(slug, config) });
+        toConnect.push({ slug, connectFn: () => this.connect(slug, config, generation) });
       } else {
         const oldConfig = this.activeConfigs.get(slug);
-        if (oldConfig && mcpConfigChanged(oldConfig, config)) {
+        if (oldConfig && mcpConfigChanged(slug, oldConfig, config)) {
           this.debug(`Config changed for ${slug}, reconnecting with fresh credentials`);
           await this.disconnect(slug);
-          toConnect.push({ slug, connectFn: () => this.connect(slug, config) });
+          toConnect.push({ slug, connectFn: () => this.connect(slug, config, generation) });
         }
       }
     }
 
     for (const [slug, server] of apiSlugs) {
       if (!currentSlugs.has(slug)) {
-        toConnect.push({ slug, connectFn: () => this.connectInProcess(slug, server) });
+        toConnect.push({ slug, connectFn: () => this.connectInProcess(slug, server, generation) });
       }
     }
 
