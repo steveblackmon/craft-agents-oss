@@ -270,6 +270,28 @@ describe('idle message release', () => {
     m.agent = null
   })
 
+  it('initializes an explicitly known-empty new session without a JSONL file', async () => {
+    const fresh = createManagedSession({ id: 'fresh', messageCount: 0 }, m.workspace)
+    ;(sm as any).sessions.set(fresh.id, fresh)
+    expect((await sm.getSession(fresh.id))?.messages).toEqual([])
+    expect(fresh.messagesLoaded).toBe(true)
+    const syncFresh = createManagedSession({ id: 'fresh-sync', messageCount: 0 }, m.workspace)
+    ;(sm as any).sessions.set(syncFresh.id, syncFresh)
+    ;(sm as any).hydrateMessagesForColdPersist(syncFresh)
+    expect(syncFresh.messagesLoaded).toBe(true)
+  })
+
+  it('a stale zero messageCount does not permit missing history after release', async () => {
+    m.messageCount = 0 // the startup header count can predate runtime messages
+    await sm.sweepIdleRuntimes()
+    const path = join(root, 'sessions', m.id, 'session.jsonl')
+    const saved = readFileSync(path)
+    rmSync(path)
+    await expect(sm.getSession(m.id)).rejects.toThrow('history unavailable')
+    expect(m.messagesLoaded).toBe(false)
+    writeFileSync(path, saved)
+  })
+
   it('queue replay hydrates before finding and clearing queued message flags', async () => {
     m.messages[0].isQueued = true
     ;(sm as any).persistSession(m)
