@@ -51,9 +51,12 @@ bun test packages/shared/src/sessions/__tests__
 ```
 
 Offline synthetic measurement (Bun 1.3.9, forced GC between samples): ten histories
-of 2,000 messages, ~16 MiB content each. JS heap: 38.59 MiB baseline → 197.03 MiB
-resident → 38.74 MiB after release → 38.91 MiB after reloading/releasing all ten.
-RSS: 318.77 → 574.26 → 572.66 → 487.79 MiB. This demonstrates reclaimed JS
-objects, **not** immediate allocator page return or a production RSS plateau.
-The live fixed-workload/RSS watch remains an integration/deployment verification.
-Look for `Released N messages for idle session …` in server logs.
+of 2,000 messages, ~16 MiB content each. JS heap: 38.55 MiB baseline → 197.04 MiB
+resident → 38.77 MiB after release. After three reload/release loops the heap was
+38.93 / 39.01 / 39.02 MiB. RSS: 311.43 → 561.55 → 582.75 MiB, then
+783.14 / 663.96 / 775.52 MiB across the loops. The final no-loss snapshot guard
+rewrites each history once per release. This demonstrates reclaimed JS objects
+and a flat heap under the repeated workload, **not** immediate allocator page
+return or a proven production RSS plateau. The live fixed-workload/RSS watch
+remains an integration/deployment verification. Look for
+`Released N messages for idle session …` in server logs.
