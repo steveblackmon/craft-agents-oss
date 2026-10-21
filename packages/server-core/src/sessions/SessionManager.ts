@@ -119,6 +119,14 @@ import { loadStatusConfig } from '@craft-agent/shared/statuses/storage'
 import { AutomationSystem, createPromptHistoryEntry, appendAutomationHistoryEntry, type AutomationSystemMetadataSnapshot, type PendingPrompt } from '@craft-agent/shared/automations'
 import { buildBackendRuntimeSignature, buildRestartRequiredSignature, filterAttachmentsForModelInput } from './runtime-config'
 import { validateArchiveTarget } from './archive-guards'
+import {
+  getRuntimeBusyReason,
+  resolveIdleDisposeMs,
+  resolveMaxLiveRuntimes,
+  resolveSweepIntervalMs,
+  runtimeHoldForToolStart,
+  selectRuntimeEvictions,
+} from './runtime-eviction'
 
 // Import from server-core domain utilities
 import { sanitizeForTitle, shouldActivateBrowserOverlay, normalizeBrowserToolName, rollbackFailedBranchCreation, releaseBrowserOwnershipOnForcedStop } from '@craft-agent/server-core/domain'
@@ -976,6 +984,13 @@ interface ManagedSession {
   thinkingTrace?: DecisionResult
   /** Suggestions answer for the current request and the candidates it used, for the follow-up line. */
   suggestionTrace?: { trace: SuggestionTrace; used: Set<string> }
+  // Idle runtime eviction (electinfo/ops#549). Runtime-only, never persisted.
+  // Last time anything touched the runtime: a send, a turn start/stop, any agent event.
+  lastRuntimeActivityAt?: number
+  // Tool holds (ScheduleWakeup / Monitor / CronCreate) keyed by hold key → expiry ms.
+  runtimeHolds?: Map<string, number>
+  // Background shells launched in the live subprocess that have not completed or been killed.
+  liveBackgroundShells?: Set<string>
 }
 
 const PI_SDK_MESSAGE_ID_CACHE_LIMIT = 256
@@ -1322,6 +1337,16 @@ export class SessionManager implements ISessionManager {
    * subprocess can race the resulting `chat` against the still-pending update.
    */
   private agentRefreshLocks: Map<string, Promise<void>> = new Map()
+  /**
+   * Idle runtime eviction (electinfo/ops#549). Sessions whose runtime (agent
+   * subprocess + MCP pool + pool server) has been idle for `idleDisposeMs` are
+   * disposed by a periodic sweep; the next message rebuilds the runtime lazily
+   * via getOrCreateAgent. `maxLiveRuntimes` optionally caps live runtimes (LRU).
+   */
+  private readonly idleDisposeMs: number = resolveIdleDisposeMs()
+  private readonly maxLiveRuntimes: number = resolveMaxLiveRuntimes()
+  private runtimeSweepTimer?: ReturnType<typeof setInterval>
+  private runtimeSweepInFlight?: Promise<string[]>
   /** Monotonic clock to ensure strictly increasing message timestamps */
   private lastTimestamp = 0
 
@@ -1790,6 +1815,9 @@ export class SessionManager implements ISessionManager {
   private setProcessing(managed: ManagedSession, processing: boolean): void {
     const was = managed.isProcessing
     managed.isProcessing = processing
+    // Turn boundaries count as activity so the idle clock starts at turn end,
+    // not at the (possibly hours-old) message that started a long turn.
+    managed.lastRuntimeActivityAt = Date.now()
     if (!was && processing) {
       sessionRuntimeHooks.onSessionStarted()
     } else if (was && !processing) {
@@ -2450,6 +2478,9 @@ export class SessionManager implements ISessionManager {
 
       // Load existing sessions from disk
       this.loadSessionsFromDisk()
+
+      // Reap idle session runtimes (electinfo/ops#549)
+      this.startRuntimeSweeper()
 
       // Signal that initialization is complete — IPC handlers waiting on initGate will proceed
       this.initGate.markReady()
@@ -3717,6 +3748,182 @@ export class SessionManager implements ISessionManager {
     managed.backendRuntimeSignature = undefined
     managed.backendRestartSignature = undefined
     unregisterSessionScopedToolCallbacks(sessionId)
+
+    // Anything that lived inside the old subprocess is gone with it: drop tool
+    // holds and live-shell tracking, and flip still-running background tasks to
+    // `orphaned` so a later "status?" query never reports them as running.
+    managed.runtimeHolds?.clear()
+    managed.liveBackgroundShells?.clear()
+    const now = Date.now()
+    for (const info of managed.backgroundTaskRegistry.values()) {
+      if (info.status === 'running') {
+        info.status = 'orphaned'
+        info.completedAt = now
+      }
+    }
+  }
+
+  /** True when the session holds an agent subprocess, MCP pool, or pool server. */
+  private hasLiveRuntime(managed: ManagedSession): boolean {
+    return !!(managed.agent || managed.mcpPool || managed.poolServer)
+  }
+
+  /** Why this session's runtime must stay up, or null when it may be disposed. */
+  private getRuntimeBusyReason(managed: ManagedSession, now = Date.now()): string | null {
+    let pendingPermissions = 0
+    for (const meta of this.pendingPermissionRequests.values()) {
+      if (meta.sessionId === managed.id) pendingPermissions++
+    }
+    let runningTasks = 0
+    for (const info of managed.backgroundTaskRegistry.values()) {
+      if (info.status === 'running') runningTasks++
+    }
+    let agentProcessing = false
+    try {
+      agentProcessing = managed.agent?.isProcessing?.() === true
+    } catch {
+      agentProcessing = false
+    }
+    return getRuntimeBusyReason({
+      isProcessing: managed.isProcessing,
+      stopRequested: managed.stopRequested,
+      hasRefreshLock: this.agentRefreshLocks.has(managed.id),
+      queuedMessages: managed.messageQueue.length,
+      agentProcessing,
+      pendingPermissionRequests: pendingPermissions,
+      pendingAuthRequest: !!managed.pendingAuthRequestId,
+      pendingAutoRetry: !!managed.autoRetryTimer,
+      runningBackgroundTasks: runningTasks,
+      liveBackgroundShells: managed.liveBackgroundShells?.size ?? 0,
+      holdUntil: managed.runtimeHolds?.values() ?? [],
+      idleForMs: now - (managed.lastRuntimeActivityAt ?? managed.lastMessageAt),
+    }, now)
+  }
+
+  /**
+   * Record runtime activity for idle eviction and track subprocess-resident
+   * background work (shells, ScheduleWakeup / Monitor / CronCreate) that must
+   * keep the runtime alive between turns. Called for every agent event.
+   */
+  private noteRuntimeActivity(managed: ManagedSession, event: AgentEvent): void {
+    const now = Date.now()
+    managed.lastRuntimeActivityAt = now
+
+    switch (event.type) {
+      case 'tool_start': {
+        const hold = runtimeHoldForToolStart(event.toolName, event.toolUseId, event.input, now)
+        if (!hold) break
+        if ('clear' in hold) {
+          managed.runtimeHolds?.delete(hold.clear)
+        } else {
+          const holds = (managed.runtimeHolds ??= new Map())
+          holds.set(hold.key, Math.max(holds.get(hold.key) ?? 0, hold.until))
+        }
+        break
+      }
+      case 'shell_backgrounded':
+        (managed.liveBackgroundShells ??= new Set()).add(event.shellId)
+        break
+      case 'shell_killed':
+        managed.liveBackgroundShells?.delete(event.shellId)
+        break
+      case 'task_completed':
+        // Background Bash completions arrive as task notifications keyed by the shell id.
+        managed.liveBackgroundShells?.delete(event.taskId)
+        break
+    }
+
+    if (managed.runtimeHolds?.size) {
+      for (const [key, until] of managed.runtimeHolds) {
+        if (until <= now) managed.runtimeHolds.delete(key)
+      }
+    }
+  }
+
+  /**
+   * Dispose a session's runtime if it is still not busy. Serialized through
+   * `agentRefreshLocks`, so a send that arrives mid-dispose waits in
+   * getOrCreateAgent → tryRefreshAgentRuntime and then rebuilds lazily.
+   * Returns true when the runtime was disposed.
+   */
+  private async evictManagedRuntime(managed: ManagedSession, reason: string): Promise<boolean> {
+    if (!this.hasLiveRuntime(managed)) return false
+    const busy = this.getRuntimeBusyReason(managed)
+    if (busy) {
+      sessionLog.info(`Keeping runtime for ${managed.id} (${reason}): ${busy}`)
+      return false
+    }
+
+    const idleForMs = Date.now() - (managed.lastRuntimeActivityAt ?? managed.lastMessageAt)
+    const work = this.disposeManagedAgentRuntime(managed, reason)
+    const tracked = work.then(() => undefined, () => undefined)
+    this.agentRefreshLocks.set(managed.id, tracked)
+    try {
+      await work
+    } finally {
+      if (this.agentRefreshLocks.get(managed.id) === tracked) {
+        this.agentRefreshLocks.delete(managed.id)
+      }
+    }
+    sessionLog.info(`Disposed runtime for session ${managed.id} (${reason}, idle ${Math.round(idleForMs / 1000)}s)`)
+    return true
+  }
+
+  /**
+   * One eviction pass: dispose idle runtimes, then enforce the live-runtime cap.
+   * Overlapping calls share the in-flight pass. Returns the disposed session ids.
+   */
+  async sweepIdleRuntimes(now = Date.now()): Promise<string[]> {
+    if (this.runtimeSweepInFlight) return this.runtimeSweepInFlight
+    const pass = (async () => {
+      const live = [...this.sessions.values()].filter(m => this.hasLiveRuntime(m))
+      const picks = selectRuntimeEvictions(
+        live.map(m => ({
+          id: m.id,
+          lastActivityAt: m.lastRuntimeActivityAt ?? m.lastMessageAt,
+          busyReason: this.getRuntimeBusyReason(m, now),
+        })),
+        now,
+        this.idleDisposeMs,
+        this.maxLiveRuntimes,
+      )
+      const disposed: string[] = []
+      for (const pick of picks) {
+        const managed = this.sessions.get(pick.id)
+        if (!managed) continue
+        try {
+          if (await this.evictManagedRuntime(managed, pick.reason)) disposed.push(pick.id)
+        } catch (error) {
+          sessionLog.warn(`Runtime eviction failed for ${pick.id}: ${error instanceof Error ? error.message : error}`)
+        }
+      }
+      if (disposed.length > 0) {
+        sessionLog.info(`Runtime sweep disposed ${disposed.length} runtime(s); ${live.length - disposed.length} live`)
+      }
+      return disposed
+    })()
+    this.runtimeSweepInFlight = pass
+    try {
+      return await pass
+    } finally {
+      this.runtimeSweepInFlight = undefined
+    }
+  }
+
+  private startRuntimeSweeper(): void {
+    if (this.runtimeSweepTimer) return
+    if (this.idleDisposeMs <= 0 && this.maxLiveRuntimes <= 0) {
+      sessionLog.info('Idle runtime eviction disabled (CRAFT_SESSION_IDLE_DISPOSE_MS=0, no CRAFT_MAX_LIVE_RUNTIMES)')
+      return
+    }
+    const intervalMs = resolveSweepIntervalMs(this.idleDisposeMs > 0 ? this.idleDisposeMs : 60_000)
+    this.runtimeSweepTimer = setInterval(() => {
+      void this.sweepIdleRuntimes().catch(error => {
+        sessionLog.warn(`Runtime sweep failed: ${error instanceof Error ? error.message : error}`)
+      })
+    }, intervalMs)
+    this.runtimeSweepTimer.unref?.()
+    sessionLog.info(`Idle runtime eviction on: idle=${this.idleDisposeMs}ms, maxLive=${this.maxLiveRuntimes || 'unlimited'}, sweep=${intervalMs}ms`)
   }
 
   /**
@@ -4172,6 +4379,7 @@ export class SessionManager implements ISessionManager {
       }) as AgentInstance
 
       sessionLog.info(`Created ${provider} agent for session ${managed.id} (model: ${backendContext.resolvedModel})${managed.sdkSessionId ? ' (resuming)' : ''}`)
+      managed.lastRuntimeActivityAt = Date.now()
 
       // ============================================================
       // Post-construction: debug callback, auth callback, postInit()
@@ -5372,6 +5580,14 @@ export class SessionManager implements ISessionManager {
       // Notify all windows for this workspace
       this.sendEvent({ type: 'session_archived', sessionId }, managed.workspace.id)
       this.emitUnreadSummaryChanged()
+      // Release the agent subprocess + MCP servers (electinfo/ops#549). A busy
+      // runtime (turn, background work, prompts) is kept; the idle sweep reaps it
+      // later. Unarchive needs nothing: the next message rebuilds lazily.
+      try {
+        await this.evictManagedRuntime(managed, 'archive')
+      } catch (error) {
+        sessionLog.warn(`Failed to dispose runtime for archived session ${sessionId}: ${error instanceof Error ? error.message : error}`)
+      }
     }
   }
 
@@ -6436,6 +6652,18 @@ export class SessionManager implements ISessionManager {
       })
     }
 
+    // Close the session's MCP clients (stdio children). The pool is owned here,
+    // not by the agent: PiAgent.destroy() deliberately leaves it open, so without
+    // this every stdio MCP server of a deleted Pi session outlived the delete.
+    if (managed.mcpPool) {
+      managed.mcpPool.disconnectAll().catch(err => {
+        sessionLog.warn(`Failed to disconnect MCP pool for ${sessionId}: ${err instanceof Error ? err.message : err}`)
+      })
+    }
+    managed.agent = null
+    managed.poolServer = undefined
+    managed.mcpPool = undefined
+
     // Cancel any pending source-activation auto-retry timer (craft-agents-oss#804).
     if (managed.autoRetryTimer) {
       clearTimeout(managed.autoRetryTimer)
@@ -6490,6 +6718,9 @@ export class SessionManager implements ISessionManager {
     if (!managed) {
       throw new Error(`Session ${sessionId} not found`)
     }
+    // Mark activity before the first await so an idle sweep cannot pick this
+    // session while the message is being persisted (electinfo/ops#549).
+    managed.lastRuntimeActivityAt = Date.now()
     this.setLastMessageClientId(sessionId, rpcContext?.callerClientId)
 
     // Source-activation auto-retry dedup (craft-agents-oss#804). When the server
@@ -7781,6 +8012,9 @@ export class SessionManager implements ISessionManager {
     if (this.keepBackgroundTasksAlive) return
     const managed = this.sessions.get(sessionId)
     if (!managed) return
+    // Background shells die with the per-turn subprocess too; stop counting them
+    // as live work for idle eviction.
+    managed.liveBackgroundShells?.clear()
     const now = Date.now()
     let orphaned = 0
     for (const info of managed.backgroundTaskRegistry.values()) {
@@ -8459,6 +8693,7 @@ export class SessionManager implements ISessionManager {
     const sessionId = managed.id
     const workspaceId = managed.workspace.id
     this.notifySessionActivity(sessionId)
+    this.noteRuntimeActivity(managed, event)
 
     switch (event.type) {
       case 'text_delta':
@@ -9979,6 +10214,11 @@ export class SessionManager implements ISessionManager {
    */
   cleanup(): void {
     sessionLog.info('Cleaning up resources...')
+
+    if (this.runtimeSweepTimer) {
+      clearInterval(this.runtimeSweepTimer)
+      this.runtimeSweepTimer = undefined
+    }
 
     // Stop all ConfigWatchers (file system watchers)
     for (const [path, watcher] of this.configWatchers) {
