@@ -116,16 +116,28 @@ export interface PoolClient {
   getPrompt?(name: string, args?: Record<string, string>, options?: PoolRequestOptions): Promise<GetPromptResult>;
 }
 
+/** Options for CraftMcpClient beyond the transport config. */
+export interface CraftMcpClientOptions {
+  /** Called when the connection closes (stdio: the child exited, or close() ran) */
+  onClose?: () => void;
+  /** Inherited env var names to drop for a stdio child (config.env still wins) */
+  omitEnv?: string[];
+}
+
 export class CraftMcpClient implements PoolClient {
   private client: Client;
   private transport: Transport;
   private connected = false;
 
-  constructor(config: McpClientConfig) {
+  constructor(config: McpClientConfig, options?: CraftMcpClientOptions) {
     this.client = new Client({
       name: 'craft-agent',
       version: '1.0.0',
     });
+    if (options?.onClose) {
+      const onClose = options.onClose;
+      this.client.onclose = () => onClose();
+    }
 
     // Create transport based on config type
     if (config.transport === 'stdio') {
@@ -133,7 +145,7 @@ export class CraftMcpClient implements PoolClient {
       // but filter out sensitive credentials to prevent leaking secrets to subprocesses
       const processEnv: Record<string, string> = {};
       for (const [key, value] of Object.entries(process.env)) {
-        if (value !== undefined && !BLOCKED_ENV_VARS.includes(key)) {
+        if (value !== undefined && !BLOCKED_ENV_VARS.includes(key) && !options?.omitEnv?.includes(key)) {
           processEnv[key] = value;
         }
       }
@@ -190,6 +202,11 @@ export class CraftMcpClient implements PoolClient {
     const info = this.client.getServerVersion();
     if (!info) return undefined;
     return { name: info.name, version: info.version };
+  }
+
+  /** PID of the stdio child, or null (HTTP transport, not started, or exited). */
+  getPid(): number | null {
+    return this.transport instanceof StdioClientTransport ? this.transport.pid : null;
   }
 
   async callTool(name: string, args: Record<string, unknown>, options?: PoolCallToolOptions): Promise<unknown> {
