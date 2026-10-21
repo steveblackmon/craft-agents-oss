@@ -101,6 +101,34 @@ describe('durability gates for history eviction', () => {
     spy.mockRestore()
   })
 
+  for (const timerDriven of [false, true]) {
+    it(`drains replacement after cancellation (${timerDriven ? 'debounce already fired' : 'explicit waiting flush'})`, async () => {
+      let finish!: () => void
+      const gate = new Promise<void>(resolve => { finish = resolve })
+      const write = (queue as any).write.bind(queue)
+      let first = true
+      const spy = spyOn(queue as any, 'write').mockImplementation(async (id: string) => {
+        const result = write(id)
+        if (first) {
+          first = false
+          await gate
+        }
+        return await result
+      })
+      queue.enqueue(snapshot('A'))
+      const owner = queue.flush('history')
+      queue.cancel('history')
+      queue.enqueue(snapshot('B'))
+      const waiter = timerDriven ? undefined : queue.flush('history')
+      if (timerDriven) await Bun.sleep(10) // B's timer now waits behind A
+      finish()
+      await Promise.all([owner, waiter])
+      expect(queue.hasUnflushed('history')).toBe(false)
+      expect(loadSession(root, 'history')?.messages[0]?.content).toBe('B')
+      spy.mockRestore()
+    })
+  }
+
   it('metadata writers can read the latest in-flight snapshot instead of stale disk history', async () => {
     queue.enqueue(snapshot('old'))
     await queue.flush('history')
