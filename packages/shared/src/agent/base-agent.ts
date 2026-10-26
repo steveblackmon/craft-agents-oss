@@ -20,7 +20,10 @@ import type { AgentEvent } from '@craft-agent/core/types';
 import type { FileAttachment } from '../utils/files.ts';
 import { expandPath } from '../utils/paths.ts';
 import { buildTransferredSessionContext } from './conversation-summary.ts';
+import { createdPrUrl } from '../pr-watch/rules.ts';
+import { getSessionScopedToolCallbacks } from './session-scoped-tool-callback-registry.ts';
 import type { ThinkingLevel } from './thinking-levels.ts';
+import type { AgentProfile } from '@craft-agent/session-tools-core';
 import { DEFAULT_THINKING_LEVEL, normalizeThinkingLevel } from './thinking-levels.ts';
 import type { PermissionMode } from './mode-manager.ts';
 import type { LoadedSource } from '../sources/types.ts';
@@ -49,6 +52,7 @@ import type { Workspace } from '../config/storage.ts';
 // Core modules
 import { PermissionManager } from './core/permission-manager.ts';
 import type { GuardedModeCheck } from './core/guarded-mode.ts';
+import type { SubagentModelPicker } from './core/subagent-model.ts';
 import { SourceManager } from './core/source-manager.ts';
 import { PromptBuilder } from './core/prompt-builder.ts';
 import { PathProcessor } from './core/path-processor.ts';
@@ -140,6 +144,9 @@ export const MINI_AGENT_TOOLS = ['Read', 'Edit', 'Write', 'Glob', 'Grep', 'Bash'
 /** MCP servers for mini agents - minimal set (docs tools are now bundled in session) */
 export const MINI_AGENT_MCP_KEYS = ['session'] as const;
 
+/** How long the post-tool hook waits to pin a PR after `gh pr create` (it verifies the PR on GitHub). */
+const PIN_CREATED_PR_TIMEOUT_MS = 8_000;
+
 // ============================================================
 // BaseAgent Abstract Class
 // ============================================================
@@ -183,6 +190,7 @@ export abstract class BaseAgent implements AgentBackend {
   // ============================================================
   protected _model: string;
   protected _thinkingLevel: ThinkingLevel;
+  protected _agentProfile: AgentProfile;
 
   // ============================================================
   // Core Modules (protected for subclass access)
@@ -254,6 +262,8 @@ export abstract class BaseAgent implements AgentBackend {
   onPermissionRequest: PermissionCallback | null = null;
   /** Guarded-mode risk check (decision model): may turn an allowed call into a prompt, never the reverse. */
   guardedModeCheck: GuardedModeCheck | null = null;
+  /** Subagent model choice (decision model, Claude only): picks a cheaper model for an Agent call. */
+  subagentModelPicker: SubagentModelPicker | null = null;
   onPlanSubmitted: PlanCallback | null = null;
   onAuthRequest: AuthCallback | null = null;
   onSourceChange: SourceChangeCallback | null = null;
@@ -277,6 +287,7 @@ export abstract class BaseAgent implements AgentBackend {
     this._sessionId = config.session?.id || `agent-${Date.now()}`;
     this._model = config.model || defaultModel;
     this._thinkingLevel = normalizeThinkingLevel(config.thinkingLevel) ?? DEFAULT_THINKING_LEVEL;
+    this._agentProfile = config.agentProfile ?? 'default';
 
     // Initialize core modules
     // PermissionManager: handles permission evaluation, mode management, and command whitelisting
@@ -301,6 +312,7 @@ export abstract class BaseAgent implements AgentBackend {
       debugMode: config.debugMode,
       systemPromptPreset: config.systemPromptPreset,
       isHeadless: config.isHeadless,
+      agentProfile: config.agentProfile,
     });
 
     // PathProcessor: expands ~ and normalizes paths
@@ -424,6 +436,45 @@ export abstract class BaseAgent implements AgentBackend {
   setThinkingLevel(level: ThinkingLevel): void {
     this._thinkingLevel = level;
     this.debug(`Thinking level set to: ${level}`);
+  }
+
+  getAgentProfile(): AgentProfile {
+    return this._agentProfile;
+  }
+
+  setAgentProfile(profile: AgentProfile): void {
+    this._agentProfile = profile;
+    this.promptBuilder.setAgentProfile(profile);
+    this.debug(`Agent profile set to: ${profile}`);
+  }
+
+  /**
+   * Post-tool hook, Coding mode: a Bash `gh pr create` pins the PR it printed to this session's PR
+   * carousel through the same verified path as pr_bind, unless it is the folder's own branch PR
+   * (shown anyway). PRs opened from another branch or worktree would otherwise never appear.
+   * Returns a note for the model when it pinned one (Claude passes it on as `additionalContext`).
+   * Never throws; bounded by PIN_CREATED_PR_TIMEOUT_MS, since Claude awaits it before its next step.
+   */
+  protected async pinCreatedPr(command: unknown, output: string): Promise<string | null> {
+    if (this._agentProfile !== 'coding' || typeof command !== 'string') return null;
+    const url = createdPrUrl(command, output);
+    const prWatch = url ? getSessionScopedToolCallbacks(this._sessionId)?.prWatch : undefined;
+    if (!url || !prWatch) return null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const result = await Promise.race([
+        prWatch.bind({ ref: url, skipBranchPr: true }),
+        new Promise<null>(resolve => { timer = setTimeout(() => resolve(null), PIN_CREATED_PR_TIMEOUT_MS); }),
+      ]);
+      if (!result?.ok || result.skipped) return null;
+      this.debug(`[pr-watch] pinned ${url} after gh pr create`);
+      return `The PR you just opened (${url}) is now pinned to this session's PR carousel; there is no need to call pr_bind.`;
+    } catch (error) {
+      this.debug(`[pr-watch] could not pin ${url}: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // ============================================================

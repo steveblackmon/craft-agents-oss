@@ -265,7 +265,9 @@ export function getDefaultOptions(envOverrides?: Record<string, string>): Partia
  * - `tools: []` drops every built-in tool. Omitting `tools` hands these
  *   one-shot queries the full Claude Code tool set (Bash, Write, Edit, …),
  *   which costs input tokens on every call. `outputFormat` keeps working: the
- *   SDK still registers its `StructuredOutput` tool (verified on 0.3.296).
+ *   SDK still registers its `StructuredOutput` tool (verified on 0.3.302). Since
+ *   0.3.302 a refused response is an error result with no `structured_output`
+ *   (`consumeLlmQueryMessages` reports it as a warning).
  * - `permissionMode: 'default'` pins the mode. Since SDK 0.3.286 an omitted
  *   mode is no longer forced to `'default'`; Claude Code picks the user's
  *   `permissions.defaultMode` from the settings it loads, else `'auto'`.

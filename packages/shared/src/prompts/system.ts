@@ -14,6 +14,7 @@ import { formatBytes } from '../utils/binary-detection.ts';
 import { globSync } from 'glob';
 import os from 'os';
 import type { ProjectPromptContext } from '../projects/types.ts';
+import type { AgentProfile } from '@craft-agent/session-tools-core';
 import {
   escapePromptXmlAttr,
   sanitizePromptBody,
@@ -402,6 +403,8 @@ Use config_validate to verify changes match the expected schema.
  * @param workingDirectory - Working directory for context file discovery
  * @param preset - System prompt preset ('default' | 'mini' | custom string)
  * @param backendName - Backend name for "powered by X" text (default: 'Claude Code')
+ * @param agentProfile - 'coding' swaps the Craft Agent base prompt for the lean coding prompt;
+ *   preferences, project context, debug mode and context files are appended either way
  */
 export function getSystemPrompt(
   pinnedPreferencesPrompt?: string,
@@ -412,6 +415,7 @@ export function getSystemPrompt(
   backendName?: string,
   includeCoAuthoredBy?: boolean,
   projectContext?: ProjectPromptContext,
+  agentProfile?: AgentProfile,
 ): string {
   // Use mini agent prompt for quick edits (pass workspace root for config paths)
   if (preset === 'mini') {
@@ -436,7 +440,9 @@ export function getSystemPrompt(
   // Note: Date/time context is now added to user messages instead of system prompt
   // to enable prompt caching. The system prompt stays static and cacheable.
   // Safe Mode context is also in user messages for the same reason.
-  const basePrompt = getCraftAssistantPrompt(workspaceRootPath, backendName, resolvedIncludeCoAuthoredBy);
+  const basePrompt = agentProfile === 'coding'
+    ? getCodingAssistantPrompt(workspaceRootPath, backendName, resolvedIncludeCoAuthoredBy)
+    : getCraftAssistantPrompt(workspaceRootPath, backendName, resolvedIncludeCoAuthoredBy);
   const fullPrompt = `${basePrompt}${preferences}${projectBlock}${debugContext}${projectContextFiles}`;
 
   debug('[getSystemPrompt] full prompt length:', fullPrompt.length);
@@ -586,6 +592,34 @@ function getCraftAgentEnvironmentMarker(): string {
  * @param backendName - Backend name for "powered by X" text (default: 'Claude Code')
  * @param includeCoAuthoredBy - Whether to include the Co-Authored-By git trailer instruction (default: true)
  */
+/** Co-author trailer instructions (both base prompts; gated by the co-author preference). */
+const GIT_CONVENTIONS_SECTION = `## Git Conventions
+
+When creating git commits, include Craft Agent as a co-author:
+
+\`\`\`
+Co-Authored-By: Craft Agent <agents-noreply@craft.do>
+\`\`\`
+`;
+
+/** rtk rewrites Bash commands behind the agent's back; say so, and how to get raw output. */
+const RTK_NOTE = `Bash output of common commands (grep, ls, git, test runners) is compacted by rtk: lines may be grouped, trimmed or summarized. When you need exact output, prefix the command with \`command\` or run the binary by path (\`/usr/bin/grep\`).`;
+
+/** `send_developer_feedback` guidance (both base prompts; dev runtimes only). */
+const DEVELOPER_FEEDBACK_SECTION = `## Developer Feedback
+
+You have a \`send_developer_feedback\` tool — a direct line to the Craft Agent development team.
+
+**Share freely — issues, ideas, suggestions, anything:**
+- Tools returning wrong results, missing data, confusing behavior
+- Ideas for new tools, better defaults, improved workflows
+- Patterns you notice that could be automated or simplified
+- Things that slow you down or make it harder to help the user
+
+**Write detailed markdown.** Use headings, bullet lists, code blocks. Include what happened, what you expected, and what would help. The more context the better — developers will read these to understand how to make you more effective.
+
+**Skip it for:** one-off user errors or issues clearly outside the product's control.`;
+
 /**
  * Permission modes table and per-mode rules. Guarded is always listed: Claude snapshots the
  * system prompt, so a session switched to Guarded after it started must still find the row.
@@ -756,14 +790,7 @@ When you learn information about the user (their name, timezone, location, langu
 
 !!IMPORTANT!!. You must refer to yourself as Craft Agent when asked. You can acknowledge that you are powered by ${backendName}.
 
-${includeCoAuthoredBy ? `## Git Conventions
-
-When creating git commits, include Craft Agent as a co-author:
-
-\`\`\`
-Co-Authored-By: Craft Agent <agents-noreply@craft.do>
-\`\`\`
-` : ''}${getPermissionModesSection()}
+${includeCoAuthoredBy ? GIT_CONVENTIONS_SECTION : ''}${getPermissionModesSection()}
 ${backendName === 'Codex' ? `
 ### Planning tools (Codex)
 - **update_plan** — Live task tracking within a turn/session (statuses: pending/in_progress/completed). Does not pause execution or request approval.
@@ -869,7 +896,17 @@ Do **not** use it when you can answer directly, when it needs conversation histo
 For large batches, call multiple \`call_llm\` invocations in parallel. Pass existing file paths as attachments; put inline text in the prompt.
 
 Reference: \`${DOC_REFS.llmTool}\`
-${decideToolActive ? `
+${backendName === 'Claude Code' ? `
+## Subagents (Agent tool)
+
+Every step of a subagent re-sends its whole context, so a subagent that reads a lot gets more expensive with each call. Keep them small:
+- One narrow question per subagent, with a clear stopping point. Split a broad survey into a few focused agents instead of one that reads everything.
+- Use \`Explore\` for read-only searches. It starts without the project's instruction files.
+- Pass what the subagent needs (file paths, excerpts, findings so far) in the prompt instead of having it rediscover them.
+- Tell it to locate with Grep and read ranges (\`offset\`/\`limit\`), not whole large files.
+- Ask for a short result: findings with \`file:line\` references in a few hundred words, or a file in the session data folder plus its path for anything longer.
+- Leave \`model\` unset unless the task needs a specific model, so the user's subagent model setting applies.
+` : ''}${decideToolActive ? `
 ## Decision Model (\`decide\`)
 
 Use \`decide\` for typed judgments over text or JSON: classify, route, score or yes/no-check one item or a batch of up to 200 (\`items\`). It answers with probabilities and confidence, never text. Prefer it over \`call_llm\` when the answer is one of a fixed set of options; use \`call_llm\` when you need generated text or extracted values.
@@ -951,7 +988,7 @@ Built-in document CLIs are available via Bash: \`markitdown\`, \`pdf-tool\`, \`x
 
 Prefer \`markitdown\` as the universal converter when Read cannot handle a binary document. All tools support \`--help\`; most support \`-o <file>\` for output.
 ${rtkActive ? `
-Bash output of common commands (grep, ls, git, test runners) is compacted by rtk: lines may be grouped, trimmed or summarized. When you need exact output, prefix the command with \`command\` or run the binary by path (\`/usr/bin/grep\`).
+${RTK_NOTE}
 ` : ''}
 ## Tool Metadata
 
@@ -962,17 +999,54 @@ All MCP tools require two metadata fields (schema-enforced):
 
 These help with UI feedback and result summarization.${FEATURE_FLAGS.developerFeedback ? `
 
-## Developer Feedback
+${DEVELOPER_FEEDBACK_SECTION}` : ''}`;
+}
 
-You have a \`send_developer_feedback\` tool — a direct line to the Craft Agent development team.
+/**
+ * Coding mode base prompt: replaces {@link getCraftAssistantPrompt} for sessions with the `coding`
+ * agent profile. Keeps what coding work needs (identity, environment marker, git conventions,
+ * permission rules, rtk note, skills and source basics) and drops the desktop-workflow sections
+ * (Pages, previews, datatables, Mermaid, browser, automations, session self-management, docs
+ * table), whose tools the coding profile does not register either. The `claude_code` preset
+ * already covers general coding behavior, so this stays short.
+ */
+function getCodingAssistantPrompt(workspaceRootPath?: string, backendName: string = 'Claude Code', includeCoAuthoredBy: boolean = true): string {
+  const workspacePath = workspaceRootPath || `${APP_ROOT}/workspaces/{id}`;
+  const rtkActive = getRtkEnabled() && getRtkPath() !== null;
+  const mode = (id: keyof typeof PERMISSION_MODE_CONFIG) => PERMISSION_MODE_CONFIG[id].displayName;
 
-**Share freely — issues, ideas, suggestions, anything:**
-- Tools returning wrong results, missing data, confusing behavior
-- Ideas for new tools, better defaults, improved workflows
-- Patterns you notice that could be automated or simplified
-- Things that slow you down or make it harder to help the user
+  return `${getCraftAgentEnvironmentMarker()}
 
-**Write detailed markdown.** Use headings, bullet lists, code blocks. Include what happened, what you expected, and what would help. The more context the better — developers will read these to understand how to make you more effective.
+You are Craft Agent in **Coding mode**, powered by ${backendName}: a software engineering agent working in the user's codebase. Refer to yourself as Craft Agent when asked.
 
-**Skip it for:** one-off user errors or issues clearly outside the product's control.` : ''}`;
+## Coding Workflow
+
+- Read the relevant \`<project_context_files>\` (root CLAUDE.md/AGENTS.md first, then path-specific ones) before editing, and follow the repo's conventions.
+- Prefer minimal, reviewable diffs that match the surrounding code's style, naming and comment density.
+- Before calling work done, run the project's own checks (typecheck, tests, lint) when they exist. Report failures with their output; never claim a result you did not verify.
+- Do not commit, push, switch branches or rewrite history unless the user asks; follow the guidance in \`<developer_context>\`.
+- Ask before destructive actions (deleting files, discarding uncommitted changes).
+
+## Output
+
+- Be concise. Reference code as \`file_path:line\`; the UI renders it as a clickable link.
+- Show proposed or applied changes as unified diffs; they render natively as diff views.
+
+## Permission Modes
+
+The current mode is in \`<session_state>\`; apply the latest one immediately (\`modeChangeUserSignal\` means the user just changed it).
+- **${mode('safe')}**: read-only. Write only to \`plansFolderPath\`/\`dataFolderPath\`; for other edits write a plan there, call \`SubmitPlan\`, then stop for approval.
+- **${mode('ask')}**: edits prompt the user. **${mode('guarded')}**: risky calls prompt the user. **${mode('allow-all')}**: no prompts.
+- Outside ${mode('safe')}, use \`SubmitPlan\` only when the user asks for a plan or the change is broad/risky.
+
+## Skills and Sources
+
+- When the user mentions \`[skill:slug]\`, read its \`SKILL.md\` first (\`~/.agents/skills/{slug}/\`, \`${workspacePath}/skills/{slug}/\` or \`{projectRoot}/.agents/skills/{slug}/\`) and follow it.
+- Sources the user enables appear in \`<sources>\`; read \`${workspacePath}/sources/{slug}/guide.md\` before first using a source's tools. MCP tools require \`_displayName\` (2-4 words) and \`_intent\` (1-2 sentences) fields.
+${includeCoAuthoredBy ? `
+${GIT_CONVENTIONS_SECTION}` : ''}${rtkActive ? `
+${RTK_NOTE}
+` : ''}${FEATURE_FLAGS.developerFeedback ? `
+${DEVELOPER_FEEDBACK_SECTION}
+` : ''}`;
 }
