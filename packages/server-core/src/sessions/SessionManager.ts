@@ -3928,6 +3928,24 @@ export class SessionManager implements ISessionManager {
       }
     }
 
+    // Background tasks lived inside the CLI that just died. Under keep-alive
+    // nothing else ever marks them terminal (markOrphanedBackgroundTasks is a
+    // no-op, and the dead query's notifications are dropped), so a leftover
+    // 'running' entry would pin the NEXT runtime as busy forever and make
+    // "status?" lie. Flip them to 'orphaned' here, for every teardown reason.
+    const orphanedAt = Date.now()
+    let orphanedTasks = 0
+    for (const info of managed.backgroundTaskRegistry.values()) {
+      if (info.status === 'running') {
+        info.status = 'orphaned'
+        info.completedAt = orphanedAt
+        orphanedTasks++
+      }
+    }
+    if (orphanedTasks > 0) {
+      sessionLog.info(`[bg-lifecycle] runtime disposed (${reason}) — orphaned ${orphanedTasks} still-running background task(s)`, { sessionId })
+    }
+
     managed.agent = null
     managed.poolServer = undefined
     managed.mcpPool = undefined

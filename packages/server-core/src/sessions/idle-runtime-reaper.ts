@@ -129,6 +129,8 @@ const WAKEUP_MIN_DELAY_S = 60
 export class ArmedScheduleTracker {
   private readonly schedules = new Map<string, ArmedSchedule>()
   private readonly seenDeletes = new Set<string>()
+  /** CronDelete toolUseId → the cron entry it removed, restored if the delete errors. */
+  private readonly pendingDeletes = new Map<string, [string, ArmedSchedule]>()
 
   /** Record a tool call; returns true when it was a scheduler tool. */
   note(toolName: string, toolUseId: string, input: Record<string, unknown> | undefined, nowMs: number): boolean {
@@ -148,7 +150,10 @@ export class ArmedScheduleTracker {
       for (const [key, s] of this.schedules) {
         if (s.kind === 'cron' && s.armedAt < oldestAt) { oldestAt = s.armedAt; oldestKey = key }
       }
-      if (oldestKey) this.schedules.delete(oldestKey)
+      if (oldestKey) {
+        this.pendingDeletes.set(toolUseId, [oldestKey, this.schedules.get(oldestKey)!])
+        this.schedules.delete(oldestKey)
+      }
       return true
     }
     if (name === 'ScheduleWakeup') {
@@ -167,9 +172,13 @@ export class ArmedScheduleTracker {
     return false
   }
 
-  /** A scheduler call that errored armed nothing. */
+  /** A scheduler call that errored armed nothing — and an errored CronDelete deleted nothing. */
   noteResult(toolUseId: string, isError: boolean): void {
-    if (isError) this.schedules.delete(toolUseId)
+    const pending = this.pendingDeletes.get(toolUseId)
+    this.pendingDeletes.delete(toolUseId)
+    if (!isError) return
+    this.schedules.delete(toolUseId)
+    if (pending) this.schedules.set(pending[0], pending[1])
   }
 
   /** Schedules still armed at `nowMs`. Crons (recurring or one-shot) count until a CronDelete. */
