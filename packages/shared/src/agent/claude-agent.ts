@@ -3225,6 +3225,23 @@ This is a branched conversation. All prior messages in this conversation are par
   }
 
   /**
+   * A turn is in flight: its channel is open, a stopped turn is still draining,
+   * or (keep-alive off) the per-turn query is open. Unlike isProcessing(), this
+   * is false between turns while keep-alive holds the persistent query open.
+   */
+  isTurnInFlight(): boolean {
+    if (this.activeTurnChannel || this.stoppedTurn) return true;
+    if (this.isCompactionInFlight()) return true;
+    if (this.keepBackgroundTasksAlive && this.persistentInput) return false;
+    return this.currentQuery !== null;
+  }
+
+  /** The CLI subprocess (persistent or per-turn query) is still alive. */
+  hasLiveQuery(): boolean {
+    return this.persistentInput !== null || this.currentQuery !== null;
+  }
+
+  /**
    * Get current permission mode.
    */
   getPermissionMode(): PermissionMode {

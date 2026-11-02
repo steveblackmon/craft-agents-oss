@@ -119,6 +119,7 @@ import { loadStatusConfig } from '@craft-agent/shared/statuses/storage'
 import { AutomationSystem, createPromptHistoryEntry, appendAutomationHistoryEntry, type AutomationSystemMetadataSnapshot, type PendingPrompt } from '@craft-agent/shared/automations'
 import { buildBackendRuntimeSignature, buildRestartRequiredSignature, filterAttachmentsForModelInput } from './runtime-config'
 import { validateArchiveTarget } from './archive-guards'
+import { ArmedScheduleTracker, evaluateIdleReap, idleRuntimeSweepIntervalMs, resolveIdleRuntimeReapMinutes, IDLE_RUNTIME_REAP_ENV, type IdleReapCandidate, type IdleReapSkipReason } from './idle-runtime-reaper'
 
 // Import from server-core domain utilities
 import { sanitizeForTitle, shouldActivateBrowserOverlay, normalizeBrowserToolName, rollbackFailedBranchCreation, releaseBrowserOwnershipOnForcedStop } from '@craft-agent/server-core/domain'
@@ -976,6 +977,14 @@ interface ManagedSession {
   thinkingTrace?: DecisionResult
   /** Suggestions answer for the current request and the candidates it used, for the follow-up line. */
   suggestionTrace?: { trace: SuggestionTrace; used: Set<string> }
+  /** Idle reaper: ms timestamp of the last turn start/end, agent event or runtime creation. Runtime-only. */
+  lastRuntimeActivityAt?: number
+  /** Idle reaper: cron jobs / wakeups the live CLI armed (they die with it). Runtime-only. */
+  armedSchedules?: ArmedScheduleTracker
+  /** Idle reaper: source rebuilds (setSessionSources / reloadSessionSources) in flight. Runtime-only. */
+  sourceUpdatesInFlight?: number
+  /** Idle reaper: "always allow" grants carried across a reap into the rebuilt agent. Runtime-only. */
+  preservedPermissionWhitelist?: { commands: string[]; domains: string[] }
 }
 
 const PI_SDK_MESSAGE_ID_CACHE_LIMIT = 256
@@ -1322,6 +1331,11 @@ export class SessionManager implements ISessionManager {
    * subprocess can race the resulting `chat` against the still-pending update.
    */
   private agentRefreshLocks: Map<string, Promise<void>> = new Map()
+  /** Idle runtime reaper threshold (`CRAFT_IDLE_RUNTIME_REAP_MINUTES`, default 60, 0 = off). */
+  private readonly idleRuntimeReapMinutes: number = resolveIdleRuntimeReapMinutes()
+  private idleRuntimeReapTimer: ReturnType<typeof setInterval> | null = null
+  private idleRuntimeSweepInFlight = false
+  private idleRuntimeReaperStopped = false
   /** Monotonic clock to ensure strictly increasing message timestamps */
   private lastTimestamp = 0
 
@@ -1790,6 +1804,7 @@ export class SessionManager implements ISessionManager {
   private setProcessing(managed: ManagedSession, processing: boolean): void {
     const was = managed.isProcessing
     managed.isProcessing = processing
+    managed.lastRuntimeActivityAt = Date.now()
     if (!was && processing) {
       sessionRuntimeHooks.onSessionStarted()
     } else if (was && !processing) {
@@ -2335,13 +2350,28 @@ export class SessionManager implements ISessionManager {
    */
   private async reloadSessionSources(managed: ManagedSession): Promise<void> {
     if (!managed.agent) return  // No agent = nothing to update (fresh build on next message)
+    // Keep the idle reaper off this session while servers are rebuilt, and let an
+    // in-flight reap/refresh finish first; it may leave no agent to update.
+    managed.sourceUpdatesInFlight = (managed.sourceUpdatesInFlight ?? 0) + 1
+    try {
+      await this.agentRefreshLocks.get(managed.id)?.catch(() => undefined)
+      await this.applyReloadedSessionSources(managed)
+    } finally {
+      managed.sourceUpdatesInFlight = (managed.sourceUpdatesInFlight ?? 1) - 1
+      managed.lastRuntimeActivityAt = Date.now()
+    }
+  }
+
+  private async applyReloadedSessionSources(managed: ManagedSession): Promise<void> {
+    const agent = managed.agent
+    if (!agent) return
 
     const workspaceRootPath = managed.workspace.rootPath
     sessionLog.info(`Reloading sources for session ${managed.id}`)
 
     // Reload all sources from disk
     const allSources = loadAllSources(workspaceRootPath)
-    managed.agent.setAllSources(allSources)
+    agent.setAllSources(allSources)
 
     // Rebuild MCP and API servers for session's enabled sources
     const enabledSlugs = managed.enabledSourceSlugs || []
@@ -2350,10 +2380,12 @@ export class SessionManager implements ISessionManager {
     )
     // Pass session path so large API responses can be saved to session folder
     const sessionPath = getSessionStoragePath(workspaceRootPath, managed.id)
-    const { mcpServers, apiServers } = await buildServersFromSources(enabledSources, sessionPath, managed.tokenRefreshManager, managed.agent?.getSummarizeCallback())
+    const { mcpServers, apiServers } = await buildServersFromSources(enabledSources, sessionPath, managed.tokenRefreshManager, agent.getSummarizeCallback())
     const intendedSlugs = enabledSources.map(s => s.config.slug)
 
-    await managed.agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
+    // Runtime replaced meanwhile: the fresh build already read the sources from disk.
+    if (managed.agent !== agent) return
+    await agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
 
     sessionLog.info(`Sources reloaded for session ${managed.id}: ${Object.keys(mcpServers).length} MCP, ${Object.keys(apiServers).length} API`)
   }
@@ -2450,6 +2482,8 @@ export class SessionManager implements ISessionManager {
 
       // Load existing sessions from disk
       this.loadSessionsFromDisk()
+
+      this.startIdleRuntimeReaper()
 
       // Signal that initialization is complete — IPC handlers waiting on initGate will proceed
       this.initGate.markReady()
@@ -3676,6 +3710,192 @@ export class SessionManager implements ISessionManager {
     return this.sessions.get(sessionId)?.workingDirectory
   }
 
+  // ============================================================
+  // Idle runtime reaper
+  // ============================================================
+  //
+  // A session's runtime (the Claude CLI kept alive between turns + its MCP pool
+  // and stdio servers) otherwise lives until the session is deleted or the
+  // server restarts, so a long-running server's memory tracks every session
+  // touched since boot. Reaping reuses disposeManagedAgentRuntime — the same
+  // teardown the runtime-config refresh path uses — and the next message
+  // rebuilds the runtime and resumes the SDK session via sdkSessionId.
+
+  private startIdleRuntimeReaper(): void {
+    if (this.idleRuntimeReapTimer) return
+    if (!(this.idleRuntimeReapMinutes > 0)) {
+      sessionLog.info(`[idle-reap] disabled (${IDLE_RUNTIME_REAP_ENV}=0)`)
+      return
+    }
+    const intervalMs = idleRuntimeSweepIntervalMs(this.idleRuntimeReapMinutes)
+    this.idleRuntimeReapTimer = setInterval(() => {
+      void this.sweepIdleRuntimes().catch((error) => {
+        sessionLog.warn(`[idle-reap] sweep failed: ${error instanceof Error ? error.message : error}`)
+      })
+    }, intervalMs)
+    this.idleRuntimeReapTimer.unref?.()
+    sessionLog.info(`[idle-reap] enabled: reaping session runtimes idle >= ${this.idleRuntimeReapMinutes}m (sweep every ${Math.round(intervalMs / 1000)}s)`)
+  }
+
+  private stopIdleRuntimeReaper(): void {
+    this.idleRuntimeReaperStopped = true
+    if (this.idleRuntimeReapTimer) clearInterval(this.idleRuntimeReapTimer)
+    this.idleRuntimeReapTimer = null
+  }
+
+  /** Gather the reap predicate's inputs for one session. */
+  private buildIdleReapCandidate(managed: ManagedSession, liveBrowser: boolean | 'unknown', nowMs: number): IdleReapCandidate {
+    let pendingPermissions = 0
+    for (const meta of this.pendingPermissionRequests.values()) {
+      if (meta.sessionId === managed.id) pendingPermissions++
+    }
+    let agentProcessing = false
+    let liveQuery = true
+    try {
+      const agent = managed.agent
+      if (agent) {
+        // Claude keep-alive holds the query open between turns, so isProcessing() is
+        // true while idle; isTurnInFlight() is the real "a turn is running" signal.
+        agentProcessing = agent.isTurnInFlight ? agent.isTurnInFlight() : agent.isProcessing()
+        liveQuery = agent.hasLiveQuery ? agent.hasLiveQuery() : true
+      }
+    } catch {
+      agentProcessing = true
+    }
+    let runningBackgroundTasks = 0
+    // Once the CLI is gone, `running` entries are stale (their completion can never
+    // arrive); they must not pin the runtime forever.
+    if (liveQuery) {
+      for (const task of managed.backgroundTaskRegistry.values()) {
+        // Any kind, tracked or not: a shell, monitor, agent or workflow dies with the CLI.
+        if (task.status === 'running') runningBackgroundTasks++
+      }
+    }
+    return {
+      hasRuntime: !!(managed.agent || managed.poolServer || managed.mcpPool),
+      isProcessing: managed.isProcessing,
+      agentProcessing,
+      transitionInFlight: !!managed.stopRequested
+        || !!managed.authRetryInProgress
+        || managed.autoRetryTimer !== undefined
+        || managed.pendingActivationResend !== undefined
+        || this.agentRefreshLocks.has(managed.id)
+        || (managed.sourceUpdatesInFlight ?? 0) > 0,
+      queuedMessages: managed.messageQueue.length,
+      pendingPermissions,
+      pendingAuth: !!(managed.pendingAuthRequestId || managed.pendingAuthRequest),
+      pendingPlan: !!managed.pendingPlanExecution || managed.lastMessageRole === 'plan',
+      runningBackgroundTasks,
+      armedSchedules: managed.armedSchedules?.countArmed(nowMs) ?? 0,
+      liveBrowser,
+      lastActivityAt: managed.lastRuntimeActivityAt ?? managed.lastMessageAt,
+    }
+  }
+
+  /**
+   * Whether a browser instance is owned by / bound to this session. Browsers live
+   * in a desktop client: with none connected that could host one, none exists.
+   * A remote query that fails or times out answers `unknown` (keep the runtime).
+   */
+  private async detectLiveBrowser(managed: ManagedSession): Promise<boolean | 'unknown'> {
+    const ownedBy = (list: Array<{ ownerSessionId: string | null; boundSessionId: string | null }>) =>
+      list.some(i => i.ownerSessionId === managed.id || i.boundSessionId === managed.id)
+    try {
+      if (this.browserPaneManager) return ownedBy(this.browserPaneManager.listInstances())
+      if (!this.rpcServer || !this.getBrowserHostClient(managed.id)) return false
+      const bpm = this.getBrowserPaneManagerForSession(managed.id)
+      if (!bpm) return false
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const timeout = new Promise<'timeout'>(resolve => { timer = setTimeout(() => resolve('timeout'), 5000) })
+      try {
+        const list = await Promise.race([bpm.listInstancesAsync(), timeout])
+        return list === 'timeout' ? 'unknown' : ownedBy(list)
+      } finally {
+        if (timer) clearTimeout(timer)
+      }
+    } catch {
+      return 'unknown'
+    }
+  }
+
+  /**
+   * One reaper pass over loaded sessions. Public for tests; normally driven by
+   * the interval started in initialize(). Returns what it did.
+   */
+  async sweepIdleRuntimes(nowMs: number = Date.now()): Promise<{ reaped: string[]; blocked: Partial<Record<IdleReapSkipReason, number>> }> {
+    const result: { reaped: string[]; blocked: Partial<Record<IdleReapSkipReason, number>> } = { reaped: [], blocked: {} }
+    const thresholdMs = this.idleRuntimeReapMinutes * 60_000
+    if (!(thresholdMs > 0) || this.idleRuntimeSweepInFlight) return result
+    this.idleRuntimeSweepInFlight = true
+    try {
+      for (const managed of [...this.sessions.values()]) {
+        if (this.idleRuntimeReaperStopped) break  // cleanup() ran mid-sweep
+        // Cheap synchronous pass first; only idle-enough candidates pay for the browser query.
+        const pre = evaluateIdleReap(this.buildIdleReapCandidate(managed, false, nowMs), nowMs, thresholdMs)
+        if (!pre.reap) {
+          if (pre.reason !== 'no-runtime' && pre.reason !== 'not-idle-long-enough' && pre.idleMs >= thresholdMs) {
+            result.blocked[pre.reason] = (result.blocked[pre.reason] ?? 0) + 1
+          }
+          continue
+        }
+        const liveBrowser = await this.detectLiveBrowser(managed)
+        // Re-evaluate after the await: a message or event may have arrived meanwhile
+        // (it bumps lastRuntimeActivityAt past nowMs, which reads as not idle).
+        const decision = evaluateIdleReap(this.buildIdleReapCandidate(managed, liveBrowser, nowMs), nowMs, thresholdMs)
+        if (!decision.reap) {
+          if (decision.reason !== 'not-idle-long-enough' && decision.reason !== 'no-runtime') {
+            result.blocked[decision.reason] = (result.blocked[decision.reason] ?? 0) + 1
+          }
+          continue
+        }
+        if (await this.reapIdleRuntime(managed, decision.idleMs)) result.reaped.push(managed.id)
+      }
+    } finally {
+      this.idleRuntimeSweepInFlight = false
+    }
+    const blockedTotal = Object.values(result.blocked).reduce((a, b) => a + (b ?? 0), 0)
+    if (result.reaped.length > 0 || blockedTotal > 0) {
+      const blocked = Object.entries(result.blocked).map(([k, v]) => `${k}=${v}`).join(',') || 'none'
+      sessionLog.info(`[idle-reap] sweep: reaped=${result.reaped.length} idle-but-kept=${blockedTotal} (${blocked})`)
+    }
+    return result
+  }
+
+  /**
+   * Tear down one idle session's runtime. Holds the session's runtime-refresh
+   * lock for the duration, so a sendMessage arriving mid-teardown waits in
+   * getOrCreateAgent and then rebuilds a fresh runtime instead of racing it.
+   */
+  private async reapIdleRuntime(managed: ManagedSession, idleMs: number): Promise<boolean> {
+    if (this.agentRefreshLocks.has(managed.id)) return false
+    const hadCli = !!managed.agent
+    const mcpSources = managed.mcpPool?.getConnectedSlugs().length ?? 0
+    const hadPoolServer = !!managed.poolServer
+    // "Always allow" grants live only in the agent's PermissionManager; carry them
+    // into the rebuilt agent so the user isn't re-prompted after a reap.
+    try {
+      const pm = (managed.agent as { getPermissionManager?: () => { getWhitelistedCommands(): Set<string>; getWhitelistedDomains(): Set<string> } } | null)?.getPermissionManager?.()
+      if (pm) {
+        const commands = [...pm.getWhitelistedCommands()]
+        const domains = [...pm.getWhitelistedDomains()]
+        if (commands.length > 0 || domains.length > 0) managed.preservedPermissionWhitelist = { commands, domains }
+      }
+    } catch (error) {
+      sessionLog.warn(`[idle-reap] could not read permission grants for ${managed.id}; keeping runtime: ${error instanceof Error ? error.message : error}`)
+      return false
+    }
+    const work = this.disposeManagedAgentRuntime(managed, 'idle-reap')
+    const tracked = work.then(() => undefined, () => undefined)
+    this.agentRefreshLocks.set(managed.id, tracked)
+    try {
+      await work
+    } finally {
+      if (this.agentRefreshLocks.get(managed.id) === tracked) this.agentRefreshLocks.delete(managed.id)
+    }
+    sessionLog.info(`[idle-reap] reaped idle runtime for session ${managed.id}: idle=${Math.round(idleMs / 60_000)}m cli=${hadCli} mcpSources=${mcpSources} poolServer=${hadPoolServer} sdkSessionId=${managed.sdkSessionId ?? 'none'}`)
+    return true
+  }
+
   private async disposeManagedAgentRuntime(managed: ManagedSession, reason: string): Promise<void> {
     const sessionId = managed.id
     this.recoverPendingSteers(managed)
@@ -3708,6 +3928,24 @@ export class SessionManager implements ISessionManager {
       }
     }
 
+    // Background tasks lived inside the CLI that just died. Under keep-alive
+    // nothing else ever marks them terminal (markOrphanedBackgroundTasks is a
+    // no-op, and the dead query's notifications are dropped), so a leftover
+    // 'running' entry would pin the NEXT runtime as busy forever and make
+    // "status?" lie. Flip them to 'orphaned' here, for every teardown reason.
+    const orphanedAt = Date.now()
+    let orphanedTasks = 0
+    for (const info of managed.backgroundTaskRegistry.values()) {
+      if (info.status === 'running') {
+        info.status = 'orphaned'
+        info.completedAt = orphanedAt
+        orphanedTasks++
+      }
+    }
+    if (orphanedTasks > 0) {
+      sessionLog.info(`[bg-lifecycle] runtime disposed (${reason}) — orphaned ${orphanedTasks} still-running background task(s)`, { sessionId })
+    }
+
     managed.agent = null
     managed.poolServer = undefined
     managed.mcpPool = undefined
@@ -3716,6 +3954,8 @@ export class SessionManager implements ISessionManager {
     managed.agentReadyResolve = undefined
     managed.backendRuntimeSignature = undefined
     managed.backendRestartSignature = undefined
+    // Anything the CLI had armed died with it.
+    managed.armedSchedules = undefined
     unregisterSessionScopedToolCallbacks(sessionId)
   }
 
@@ -3916,6 +4156,8 @@ export class SessionManager implements ISessionManager {
 
     if (!managed.agent) {
       const end = perf.start('agent.create', { sessionId: managed.id })
+      managed.lastRuntimeActivityAt = Date.now()
+      managed.armedSchedules = new ArmedScheduleTracker()
 
       // Lock the connection after first resolution
       // This ensures the session always uses the same provider
@@ -4172,6 +4414,17 @@ export class SessionManager implements ISessionManager {
       }) as AgentInstance
 
       sessionLog.info(`Created ${provider} agent for session ${managed.id} (model: ${backendContext.resolvedModel})${managed.sdkSessionId ? ' (resuming)' : ''}`)
+
+      // Re-apply "always allow" grants an idle reap carried over from the previous agent.
+      const preserved = managed.preservedPermissionWhitelist
+      if (preserved) {
+        managed.preservedPermissionWhitelist = undefined
+        const pm = (managed.agent as { getPermissionManager?: () => { whitelistCommand(c: string): void; whitelistDomain(d: string): void } }).getPermissionManager?.()
+        if (pm) {
+          for (const command of preserved.commands) pm.whitelistCommand(command)
+          for (const domain of preserved.domains) pm.whitelistDomain(domain)
+        }
+      }
 
       // ============================================================
       // Post-construction: debug callback, auth callback, postInit()
@@ -5739,6 +5992,18 @@ export class SessionManager implements ISessionManager {
       throw new Error(`Session not found: ${sessionId}`)
     }
 
+    // Keep the idle reaper off this session while servers are rebuilt.
+    managed.sourceUpdatesInFlight = (managed.sourceUpdatesInFlight ?? 0) + 1
+    try {
+      await this.applySessionSources(managed, sourceSlugs)
+    } finally {
+      managed.sourceUpdatesInFlight = (managed.sourceUpdatesInFlight ?? 1) - 1
+      managed.lastRuntimeActivityAt = Date.now()
+    }
+  }
+
+  private async applySessionSources(managed: ManagedSession, sourceSlugs: string[]): Promise<void> {
+    const sessionId = managed.id
     const workspaceRootPath = managed.workspace.rootPath
     sessionLog.info(`Setting sources for session ${sessionId}:`, sourceSlugs)
 
@@ -5758,26 +6023,34 @@ export class SessionManager implements ISessionManager {
     // Store the selection
     managed.enabledSourceSlugs = sourceSlugs
 
+    // An in-flight reap/refresh finishes first; it may leave no agent to update
+    // (the next message's fresh build reads enabledSourceSlugs).
+    await this.agentRefreshLocks.get(sessionId)?.catch(() => undefined)
+
     // If agent exists, build and apply servers immediately
-    if (managed.agent) {
+    const agent = managed.agent
+    if (agent) {
       const sources = getSourcesBySlugs(workspaceRootPath, sourceSlugs)
       // Pass session path so large API responses can be saved to session folder
       const sessionPath = getSessionStoragePath(workspaceRootPath, sessionId)
-      const { mcpServers, apiServers, errors } = await buildServersFromSources(sources, sessionPath, managed.tokenRefreshManager, managed.agent.getSummarizeCallback())
+      const { mcpServers, apiServers, errors } = await buildServersFromSources(sources, sessionPath, managed.tokenRefreshManager, agent.getSummarizeCallback())
       if (errors.length > 0) {
         sessionLog.warn(`Source build errors:`, errors)
       }
 
-      // Set all sources for context (agent sees full list with descriptions, including built-ins)
-      const allSources = loadAllSources(workspaceRootPath)
-      managed.agent.setAllSources(allSources)
+      // Runtime replaced meanwhile: skip applying to the stale agent.
+      if (managed.agent === agent) {
+        // Set all sources for context (agent sees full list with descriptions, including built-ins)
+        const allSources = loadAllSources(workspaceRootPath)
+        agent.setAllSources(allSources)
 
-      // Set active source servers (tools are only available from these)
-      const intendedSlugs = sources.filter(isSourceUsable).map(s => s.config.slug)
+        // Set active source servers (tools are only available from these)
+        const intendedSlugs = sources.filter(isSourceUsable).map(s => s.config.slug)
 
-      await managed.agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
+        await agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
 
-      sessionLog.info(`Applied ${Object.keys(mcpServers).length} MCP + ${Object.keys(apiServers).length} API sources to active agent (${allSources.length} total)`)
+        sessionLog.info(`Applied ${Object.keys(mcpServers).length} MCP + ${Object.keys(apiServers).length} API sources to active agent (${allSources.length} total)`)
+      }
     }
 
     // Persist the session with updated sources
@@ -8459,6 +8732,7 @@ export class SessionManager implements ISessionManager {
     const sessionId = managed.id
     const workspaceId = managed.workspace.id
     this.notifySessionActivity(sessionId)
+    managed.lastRuntimeActivityAt = Date.now()
 
     switch (event.type) {
       case 'text_delta':
@@ -8568,6 +8842,10 @@ export class SessionManager implements ISessionManager {
 
       case 'tool_start': {
         this.noteSuggestionUse(managed, { toolName: event.toolName, input: event.input })
+        if (managed.agent) {
+          managed.armedSchedules ??= new ArmedScheduleTracker()
+          managed.armedSchedules.note(event.toolName, event.toolUseId, event.input, Date.now())
+        }
         noteLargeResultFileUse(managed.id, event.input)
         // Format tool input paths to relative for better readability
         const formattedToolInput = formatToolInputPaths(event.input, managed.workingDirectory)
@@ -8699,6 +8977,7 @@ export class SessionManager implements ISessionManager {
       }
 
       case 'tool_result': {
+        managed.armedSchedules?.noteResult(event.toolUseId, event.isError)
         // toolName comes directly from CraftAgent (resolved via ToolIndex)
         const toolName = event.toolName || 'unknown'
 
@@ -9979,6 +10258,8 @@ export class SessionManager implements ISessionManager {
    */
   cleanup(): void {
     sessionLog.info('Cleaning up resources...')
+
+    this.stopIdleRuntimeReaper()
 
     // Stop all ConfigWatchers (file system watchers)
     for (const [path, watcher] of this.configWatchers) {
