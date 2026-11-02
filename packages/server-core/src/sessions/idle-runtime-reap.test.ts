@@ -215,6 +215,29 @@ describe('SessionManager.sweepIdleRuntimes', () => {
     expect((await sm.sweepIdleRuntimes(NOW)).reaped).toEqual([])
   })
 
+  it('a cleanup() landing mid-sweep stops it before the next session', async () => {
+    injectIdleSession(sm, 'first', tmpRoot)
+    injectIdleSession(sm, 'second', tmpRoot)
+    let calls = 0
+    ;(sm as any).browserPaneManager = { listInstances: () => { if (calls++ === 0) sm.cleanup(); return [] } }
+    expect((await sm.sweepIdleRuntimes(NOW)).reaped).toEqual(['first'])
+  })
+
+  for (const which of ['setSessionSources', 'reloadSessionSources'] as const) {
+    it(`${which} skips applying to an agent replaced while servers were being built`, async () => {
+      const { managed } = injectIdleSession(sm, 'replaced', tmpRoot)
+      const oldAgent = managed.agent
+      let applied = 0
+      oldAgent.setAllSources = () => { if (managed.agent !== oldAgent) applied++ }
+      oldAgent.setSourceServers = async () => { applied++ }
+      // getSummarizeCallback runs just before the server build await: swap the runtime there.
+      oldAgent.getSummarizeCallback = () => { managed.agent = { isProcessing: () => false }; return undefined }
+      if (which === 'setSessionSources') await sm.setSessionSources('replaced', [])
+      else await (sm as any).reloadSessionSources(managed)
+      expect(applied).toBe(0)
+    })
+  }
+
   it('does not count a pending permission belonging to another session', async () => {
     injectIdleSession(sm, 'mine', tmpRoot)
     ;(sm as any).pendingPermissionRequests.set('req-1', { sessionId: 'someone-else' })

@@ -3825,7 +3825,7 @@ export class SessionManager implements ISessionManager {
   async sweepIdleRuntimes(nowMs: number = Date.now()): Promise<{ reaped: string[]; blocked: Partial<Record<IdleReapSkipReason, number>> }> {
     const result: { reaped: string[]; blocked: Partial<Record<IdleReapSkipReason, number>> } = { reaped: [], blocked: {} }
     const thresholdMs = this.idleRuntimeReapMinutes * 60_000
-    if (!(thresholdMs > 0) || this.idleRuntimeSweepInFlight || this.idleRuntimeReaperStopped) return result
+    if (!(thresholdMs > 0) || this.idleRuntimeSweepInFlight) return result
     this.idleRuntimeSweepInFlight = true
     try {
       for (const managed of [...this.sessions.values()]) {
