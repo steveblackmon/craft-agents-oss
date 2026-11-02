@@ -204,6 +204,9 @@ export const playgroundAllowListHandle: PlaygroundAllowListHandle = {
 export const mockElectronAPI = {
   isDebugMode: async () => true,
 
+  // useInlineMention logs every keystroke through this
+  debugLog: (..._args: unknown[]) => {},
+
   // Called at module-load time by SessionFilesSection.tsx (and others) to
   // branch between Electron and web-UI rendering. Must be synchronous.
   getRuntimeEnvironment: (): 'electron' | 'web' => 'electron',
@@ -226,6 +229,35 @@ export const mockElectronAPI = {
   openFolderDialog: async () => {
     console.log('[Playground] openFolderDialog called')
     return null
+  },
+
+  // Coding mode worktree picker: a bare-layout repo from a recent folder, a plain clone in the
+  // workspace folder, and two GitHub-only repos. Creating fails for a branch named "taken".
+  listCodingRepos: async (workspaceId: string, recentDirs: string[]) => {
+    console.log('[Playground] listCodingRepos called:', workspaceId, recentDirs)
+    await new Promise(resolve => setTimeout(resolve, 500))
+    return {
+      local: [
+        { kind: 'local' as const, name: 'craft-agents', nameWithOwner: 'craft-ai-agents/craft-agents', gitDir: '/Users/demo/Workspace/CraftAgentsDev/.bare', worktreeParent: '/Users/demo/Workspace/CraftAgentsDev', worktrees: 31, origin: 'recent' as const },
+        { kind: 'local' as const, name: 'blurhash-rs', nameWithOwner: 'demo/blurhash-rs', gitDir: '/Users/demo/Workspace/blurhash-rs/.git', worktreeParent: '/Users/demo/Workspace', worktrees: 1, origin: 'workspace' as const },
+      ],
+      github: [
+        { kind: 'github' as const, nameWithOwner: 'demo/embercourt', description: 'Card game server', isPrivate: true, updatedAt: Date.now() - 86_400_000 },
+        { kind: 'github' as const, nameWithOwner: 'demo/gyul.ai', isPrivate: false, updatedAt: Date.now() - 3 * 86_400_000 },
+      ],
+      cloneRoot: '/Users/demo/Workspace',
+    }
+  },
+
+  createCodingWorktree: async (workspaceId: string, request: { gitDir?: string; cloneNameWithOwner?: string; branch: string }) => {
+    console.log('[Playground] createCodingWorktree called:', workspaceId, request)
+    await new Promise(resolve => setTimeout(resolve, request.cloneNameWithOwner ? 1800 : 900))
+    if (request.branch.endsWith('taken')) throw new Error(`a branch named '${request.branch}' already exists`)
+    const slug = request.branch.split('/').pop()
+    const path = request.gitDir?.endsWith('/.bare')
+      ? `/Users/demo/Workspace/CraftAgentsDev/${slug}`
+      : `/Users/demo/Workspace/${(request.cloneNameWithOwner ?? request.gitDir ?? 'repo').split('/').filter(p => p && p !== '.git').pop()}-${slug}`
+    return { path, branch: request.branch, base: 'origin/main', cloned: !!request.cloneNameWithOwner }
   },
 
   getBackgroundTaskOutput: async (sessionId: string, taskId: string) => {
@@ -304,6 +336,15 @@ export const mockElectronAPI = {
   showInFolder: async (path: string) => {
     console.log('[Playground] showInFolder called:', path)
     alert(`Would reveal in file manager:\n${path}`)
+  },
+
+  getHomeDir: async () => '/Users/you',
+
+  testRemoteConnection: async (_url: string, _token: string) => ({ ok: true }),
+
+  removeWorkspace: async (workspaceId: string) => {
+    console.log('[Playground] removeWorkspace called:', workspaceId)
+    return true
   },
 
   // NavigationProvider subscribes to deep-link IPC on mount; in the playground

@@ -23,7 +23,7 @@ import {
 } from '../config/llm-connections.ts';
 import type { McpClientPool } from '../mcp/mcp-pool.ts';
 import { proxyToolName } from '../mcp/proxy-tool-name.ts';
-import { loadPlanFromPath, type SessionConfig as Session } from '../sessions/storage.ts';
+import { loadPlanFromPath } from '../sessions/storage.ts';
 import { loadProjectById, getProjectAssetsPath, listProjectAssets, getProjectMemoryPath, loadProjectMemory } from '../projects/storage.ts';
 import { DEFAULT_MODEL, isClaudeModel, isAdaptiveThinkingAlwaysOnModel, getDefaultSummarizationModel, getModelContextWindow } from '../config/models.ts';
 import { getCredentialManager } from '../credentials/index.ts';
@@ -48,7 +48,7 @@ import {
   cleanupSessionScopedTools,
   type AuthRequest,
 } from './session-scoped-tools.ts';
-import { type AutomationSystem, type SdkAutomationCallbackMatcher, type SdkAutomationInput } from '../automations/index.ts';
+import { type SdkAutomationCallbackMatcher, type SdkAutomationInput } from '../automations/index.ts';
 import {
   getPermissionMode,
   getPermissionModeDiagnostics,
@@ -78,7 +78,8 @@ import {
 } from './core/pre-tool-use.ts';
 import { applyGuardedModeCheck, needsGuardedModeCheck } from './core/guarded-mode.ts';
 import { getRtkPath } from './core/rtk-detector.ts';
-import { getRtkEnabled, getRtkExcludeCommands } from '../config/storage.ts';
+import { getRtkEnabled, getRtkExcludeCommands, getSubagentModel } from '../config/storage.ts';
+import { chooseSubagentModel } from './core/subagent-model.ts';
 import type { RtkContext } from './core/rtk-rewrite.ts';
 import { type ThinkingLevel, THINKING_TO_EFFORT, getThinkingTokens, DEFAULT_THINKING_LEVEL } from './thinking-levels.ts';
 import { generateConversationSummary } from './conversation-summary.ts';
@@ -212,62 +213,12 @@ export function claudeThinkingKey(thinking: Partial<Options>): string {
 /** Bound for applying thinking to a live query before a turn: the turn never waits longer. */
 const LIVE_THINKING_UPDATE_TIMEOUT_MS = 2_000;
 
-export interface ClaudeAgentConfig {
-  workspace: Workspace;
-  session?: Session;           // Current session (primary isolation boundary)
-  mcpToken?: string;           // Override token (for testing)
-  model?: string;
-  thinkingLevel?: ThinkingLevel; // Initial thinking level (defaults to 'medium')
-  onSdkSessionIdUpdate?: (sdkSessionId: string) => void;  // Callback when SDK session ID is captured
-  onSdkSessionIdCleared?: () => void;  // Callback when SDK session ID is cleared (e.g., after failed resume)
-  /**
-   * Callback when branch-fork metadata is invalidated (parent cwd missing on this machine,
-   * or SDK fork spawn failed). Clears branchFromSdk* + sdkSessionId atomically.
-   * See BackendConfig.onBranchForkInvalidated for details.
-   */
-  onBranchForkInvalidated?: () => void;
-  /**
-   * Callback to get recent messages for recovery context.
-   * Called when SDK resume fails and we need to inject previous conversation context into retry.
-   * Returns last N user/assistant message pairs for context injection.
-   */
-  getRecoveryMessages?: () => RecoveryMessage[];
-  /** All parent messages for branch fork fallback (summarized via mini on fork failure). */
-  getBranchFallbackMessages?: () => RecoveryMessage[];
-  /** Branch seed messages for seeded-fresh-session context strategy. */
-  getBranchSeedMessages?: () => RecoveryMessage[];
-  /** Mark branch seed as applied (called after first injection). */
-  markBranchSeedApplied?: () => void;
-  /** Get transferred session summary for cross-server session context. */
-  getTransferredSessionSummary?: () => string | null;
-  /** Mark transferred session summary as applied. */
-  markTransferredSessionSummaryApplied?: () => void;
-  isHeadless?: boolean;        // Running in headless mode (disables interactive tools)
-  /** Skip agent-level config file watching (server already owns a workspace-level watcher) */
-  skipConfigWatcher?: boolean;
-  debugMode?: {                // Debug mode configuration (when running in dev)
-    enabled: boolean;          // Whether debug mode is active
-    logFilePath?: string;      // Path to the log file for querying
-  };
-  /** System prompt preset for mini agents ('default' | 'mini' or custom string) */
-  systemPromptPreset?: 'default' | 'mini' | string;
-  /** Workspace-level AutomationSystem instance (shared across all agents in the workspace) */
-  automationSystem?: AutomationSystem;
-  /**
-   * Per-session environment variable overrides for the SDK subprocess.
-   * Used to pass connection-specific config like ANTHROPIC_BASE_URL that
-   * must not be clobbered by concurrent sessions.
-   */
-  envOverrides?: Record<string, string>;
-  /** Mini/utility model for summarization, title generation, and mini completions. */
-  miniModel?: string;
-  /** Centralized MCP client pool for source tool execution. */
-  mcpPool?: McpClientPool;
-  /** LLM connection slug for credential lookup in postInit(). */
-  connectionSlug?: string;
-  /** Enable 1M context window for current Opus models. Default: true. Set false to use 200K and conserve usage limits. */
-  enable1MContext?: boolean;
-}
+/**
+ * ClaudeAgent's config is the backend config (the provider is implied). The constructor passes it to
+ * BaseAgent whole, so every BackendConfig field reaches `this.config`: a hand-copied field list here
+ * once dropped each field added later (agentProfile, enable1MContext, autoCompactWindow, onImageResize).
+ */
+export type ClaudeAgentConfig = Omit<BackendConfig, 'provider'>;
 
 // Permission request tracking
 interface PendingPermission {
@@ -506,7 +457,7 @@ const buildWindowsSkillsDirError = buildWindowsSkillsDirErrorFn;
 
 export class ClaudeAgent extends BaseAgent {
   protected backendName = 'Claude';
-  // Note: ClaudeAgentConfig is compatible with BackendConfig, so we use the inherited this.config
+  // The constructor's whole config is the inherited this.config (see ClaudeAgentConfig)
   private currentQuery: Query | null = null;
   private currentQueryAbortController: AbortController | null = null;
   private lastAbortReason: AbortReason | null = null;
@@ -904,39 +855,12 @@ export class ClaudeAgent extends BaseAgent {
     // Resolve model: prioritize session model > config model > current Anthropic default.
     const model = config.session?.model ?? config.model ?? DEFAULT_MODEL;
 
-    // Build BackendConfig for BaseAgent
     // Context window from registry (1M for Opus/Sonnet 4.6, 200K for others)
     const CLAUDE_CONTEXT_WINDOW = getModelContextWindow(model) ?? 200_000;
-    const backendConfig: BackendConfig = {
-      provider: 'anthropic',
-      workspace: config.workspace,
-      session: config.session,
-      model,
-      thinkingLevel: config.thinkingLevel,
-      mcpToken: config.mcpToken,
-      isHeadless: config.isHeadless,
-      skipConfigWatcher: config.skipConfigWatcher,
-      debugMode: config.debugMode,
-      systemPromptPreset: config.systemPromptPreset,
-      onSdkSessionIdUpdate: config.onSdkSessionIdUpdate,
-      onSdkSessionIdCleared: config.onSdkSessionIdCleared,
-      onBranchForkInvalidated: config.onBranchForkInvalidated,
-      getRecoveryMessages: config.getRecoveryMessages,
-      getBranchFallbackMessages: config.getBranchFallbackMessages,
-      getBranchSeedMessages: config.getBranchSeedMessages,
-      markBranchSeedApplied: config.markBranchSeedApplied,
-      getTransferredSessionSummary: config.getTransferredSessionSummary,
-      markTransferredSessionSummaryApplied: config.markTransferredSessionSummaryApplied,
-      envOverrides: config.envOverrides,
-      miniModel: config.miniModel,
-      mcpPool: config.mcpPool,
-      connectionSlug: config.connectionSlug,
-      automationSystem: config.automationSystem,
-    };
 
-    // Call BaseAgent constructor - initializes model, thinkingLevel, permissionManager, sourceManager, etc.
-    // The inherited this.config is set by super() and compatible with ClaudeAgentConfig
-    super(backendConfig, DEFAULT_MODEL, CLAUDE_CONTEXT_WINDOW);
+    // BaseAgent gets the whole config as this.config (and initializes model, thinkingLevel, profile,
+    // permissionManager, sourceManager, etc.). Never rebuild it from a field list: see ClaudeAgentConfig.
+    super({ ...config, provider: 'anthropic', model }, DEFAULT_MODEL, CLAUDE_CONTEXT_WINDOW);
 
     this.isHeadless = config.isHeadless ?? false;
     this.automationSystem = config.automationSystem;
@@ -1052,6 +976,12 @@ export class ClaudeAgent extends BaseAgent {
 
   // "Always Allow" keys come with each prompt (PromptInfo.remember) and are applied via
   // this.permissionManager.remember(); see core/permission-remember.ts
+
+  /** Whether this session talks to Anthropic directly, where the Agent tool's model aliases resolve. */
+  private usesFirstPartyClaude(): boolean {
+    const connection = this.config.connectionSlug ? getLlmConnection(this.config.connectionSlug) : null;
+    return connection?.providerType === 'anthropic' && (connection.authType === 'oauth' || connection.authType === 'api_key');
+  }
 
   /**
    * Respond to a pending permission request.
@@ -1184,7 +1114,11 @@ export class ClaudeAgent extends BaseAgent {
       // Build full MCP servers set first, then filter for mini agents
       const fullMcpServers: Options['mcpServers'] = {
         // Session-scoped tools (SubmitPlan, source_test, update_user_preferences, transform_data, etc.)
-        session: getSessionScopedTools(sessionId, this.workspaceRootPath),
+        session: getSessionScopedTools(sessionId, this.workspaceRootPath, undefined, {
+          profile: this._agentProfile,
+          hasEnabledSources: this.sourceManager.getIntendedSlugs().size > 0,
+          hasProject: !!this.config.session?.projectId,
+        }),
         // Per-source proxy servers from centralized MCP pool (MCP + API sources)
         // Each source gets its own SDK server keyed by slug (e.g., 'linear', 'github', 'gmail')
         // so the SDK produces correct tool names: mcp__{slug}__{toolName}
@@ -1263,6 +1197,9 @@ export class ClaudeAgent extends BaseAgent {
       const options: Options = {
         ...getDefaultOptions(this.config.envOverrides),
         model: effectiveModel,
+        // Compact earlier than the SDK default (the model's full window, 1M on first-party Opus even
+        // without the [1m] suffix): every call re-reads the whole context. Subagents inherit it.
+        ...(this.config.autoCompactWindow ? { settings: { autoCompactWindow: this.config.autoCompactWindow } } : {}),
         // Capture stderr from SDK subprocess for error diagnostics
         // This helps identify why sessions fail with "process exited with code 1"
         stderr: (data: string) => {
@@ -1329,6 +1266,7 @@ export class ClaudeAgent extends BaseAgent {
                 undefined, // backendName
                 this.pinnedIncludeCoAuthoredBy ?? undefined,
                 this.pinnedProjectContext ?? undefined,
+                this._agentProfile,
               ),
             },
         // Use sdkCwd for SDK session storage - this is set once at session creation and never changes.
@@ -1467,10 +1405,29 @@ export class ClaudeAgent extends BaseAgent {
                 });
               }
 
+              // Agent calls that name no model get the decision model's pick or the Settings default,
+              // when cheaper than the session's model (first-party Claude only: aliases may not resolve elsewhere).
+              const subagentModel = (checkResult.type === 'allow' || checkResult.type === 'modify')
+                && (input.tool_name === 'Agent' || input.tool_name === 'Task') && this.usesFirstPartyClaude()
+                ? await chooseSubagentModel(checkResult.type === 'modify' ? checkResult.input : toolInput, this._model, {
+                    configured: getSubagentModel(),
+                    picker: this.subagentModelPicker,
+                  })
+                : undefined;
+
               // Translate result to SDK format. The wrapper drains steers only
               // after this hook returns an emitting allow/modify result.
               switch (checkResult.type) {
                 case 'allow':
+                  if (subagentModel) {
+                    return {
+                      continue: true,
+                      hookSpecificOutput: {
+                        hookEventName: 'PreToolUse' as const,
+                        updatedInput: { ...toolInput, model: subagentModel },
+                      },
+                    };
+                  }
                   return { continue: true };
 
                 case 'modify':
@@ -1478,7 +1435,7 @@ export class ClaudeAgent extends BaseAgent {
                     continue: true,
                     hookSpecificOutput: {
                       hookEventName: 'PreToolUse' as const,
-                      updatedInput: checkResult.input,
+                      updatedInput: subagentModel ? { ...checkResult.input, model: subagentModel } : checkResult.input,
                     },
                   };
 
@@ -1616,8 +1573,13 @@ export class ClaudeAgent extends BaseAgent {
           // mid-turn. Craft never sees a detached call's late result (it reaches the model as a
           // queued task notification), so keep every tool attached. The event adapter still
           // renders a detached placeholder sensibly (`isDetachedToolCallResult`).
+          // Coding mode: a Bash `gh pr create` pins the PR it opened (pinCreatedPrHook). Hooks
+          // run in parallel on the original output; the two act on different tools.
           PostToolUse: [{
-            hooks: [async (input) => this.guardLargeMcpToolOutput(input)],
+            hooks: [
+              async (input) => this.guardLargeMcpToolOutput(input),
+              async (input) => this.pinCreatedPrHook(input),
+            ],
           }],
 
           // ═══════════════════════════════════════════════════════════════════════════
@@ -2563,7 +2525,7 @@ This is a branched conversation. All prior messages in this conversation are par
     )
     const contextParts = this.promptBuilder.buildContextParts(
       { plansFolderPath: getSessionPlansPath(this.workspaceRootPath, this.modeSessionId) },
-      this.sourceManager.formatSourceState()
+      this.sourceManager.formatSourceState({ activeOnly: this._agentProfile === 'coding' })
     );
 
     parts.push(...contextParts);
@@ -2609,7 +2571,7 @@ This is a branched conversation. All prior messages in this conversation are par
     )
     const contextParts = this.promptBuilder.buildContextParts(
       { plansFolderPath: getSessionPlansPath(this.workspaceRootPath, this.modeSessionId) },
-      this.sourceManager.formatSourceState()
+      this.sourceManager.formatSourceState({ activeOnly: this._agentProfile === 'coding' })
     );
 
     for (const part of contextParts) {
@@ -2918,6 +2880,26 @@ This is a branched conversation. All prior messages in this conversation are par
     // Optional chaining: partially constructed agents (teardown, prototype-based
     // test fixtures) have no adapter and must read as "not compacting".
     return this.isProcessing() && this.eventAdapter?.isManualCompactionRequested() === true;
+  }
+
+  /**
+   * PostToolUse, Coding mode: pin the PR a Bash `gh pr create` printed (`BaseAgent.pinCreatedPr`)
+   * and tell the model through `additionalContext`, so it doesn't pin it again with pr_bind.
+   */
+  private async pinCreatedPrHook(input: SdkAutomationInput): Promise<{
+    continue: boolean;
+    hookSpecificOutput?: { hookEventName: 'PostToolUse'; additionalContext: string };
+  }> {
+    if (input.hook_event_name !== 'PostToolUse' || input.tool_name !== 'Bash') return { continue: true };
+    // Typed as a string for automations; for Bash the SDK passes { stdout, stderr, interrupted }.
+    const response: unknown = input.tool_response;
+    const output = typeof response === 'string'
+      ? response
+      : [(response as { stdout?: unknown } | null)?.stdout, (response as { stderr?: unknown } | null)?.stderr]
+          .filter((part): part is string => typeof part === 'string')
+          .join('\n');
+    const note = await this.pinCreatedPr(input.tool_input?.command, output);
+    return note ? { continue: true, hookSpecificOutput: { hookEventName: 'PostToolUse', additionalContext: note } } : { continue: true };
   }
 
   /**

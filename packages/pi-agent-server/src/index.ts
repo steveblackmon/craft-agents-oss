@@ -83,6 +83,7 @@ import {
   normalizeCustomEndpointModelEntry,
   stripPiPrefix,
   type CustomEndpointApi,
+  type CustomEndpointConfig,
   type CustomEndpointModelEntry,
   type CustomEndpointModelOverrides,
 } from './custom-endpoint-models.ts';
@@ -137,8 +138,10 @@ interface InitMessage {
   branchFromSdkSessionId?: string;
   branchFromSessionPath?: string;
   branchFromSdkTurnId?: string;
-  customEndpoint?: { api: CustomEndpointApi; supportsImages?: boolean };
+  customEndpoint?: CustomEndpointConfig;
   customModels?: Array<string | { id: string; contextWindow?: number; supportsImages?: boolean }>;
+  /** Compact once context reaches this many tokens (config.json `autoCompactWindow`). */
+  autoCompactWindow?: number;
   piAuth?: { provider: string; credential: PiCredential };
 }
 
@@ -149,7 +152,7 @@ interface RuntimeConfigUpdateMessage {
   providerType?: string;
   authType?: string;
   baseUrl?: string;
-  customEndpoint?: { api: CustomEndpointApi; supportsImages?: boolean };
+  customEndpoint?: CustomEndpointConfig;
   customModels?: Array<string | { id: string; contextWindow?: number; supportsImages?: boolean }>;
 }
 
@@ -511,7 +514,10 @@ function registerCustomEndpointModels(
     authHeader: true,
     models: allIds.map(id => buildCustomEndpointModelDef(
       id,
-      { supportsImages: initConfig?.customEndpoint?.supportsImages === true },
+      {
+        supportsImages: initConfig?.customEndpoint?.supportsImages === true,
+        maxTokens: initConfig?.customEndpoint?.maxTokens,
+      },
       customModelOverrides.get(id),
       api,
     )),
@@ -668,7 +674,7 @@ async function ensureSession(): Promise<AgentSession> {
   // settingsManager: explicit in-memory settings (retry policy, compaction)
   // instead of the SDK default that merges `<cwd>/.pi/settings.json` from the
   // user's working directory and writes to `<agentDir>/settings.json`.
-  const settingsManager = createCraftSettingsManager('main');
+  const settingsManager = createCraftSettingsManager('main', { autoCompactWindow: initConfig.autoCompactWindow });
   // Resource isolation: never resolve extensions/skills from ~/.pi/agent.
   const agentDir = resolveCraftAgentDir(initConfig);
   const sessionOptions: CreateAgentSessionOptions = {

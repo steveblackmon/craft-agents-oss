@@ -557,6 +557,13 @@ export interface AgentEventUsage {
   costUsd?: number;
   /** Model's context window size in tokens (from SDK modelUsage) */
   contextWindow?: number;
+  /**
+   * Totals for the backend's whole session so far (Claude SDK `total_cost_usd` and `modelUsage`,
+   * subagents included). They grow across turns and resumes and restart at /clear or a new SDK
+   * session, so consumers add the change since the last totals instead of summing; when present
+   * they replace `costUsd`/`outputTokens` for cumulative accounting.
+   */
+  runningTotals?: { costUsd: number; outputTokens: number };
 }
 
 /**

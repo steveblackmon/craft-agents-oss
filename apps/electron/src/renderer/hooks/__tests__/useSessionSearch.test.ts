@@ -66,4 +66,60 @@ describe('computeCollapsedPagination', () => {
     expect(result.paginatedItems.map(s => s.id)).toEqual(['a', 'b'])
     expect(result.collapsedGroupsMeta).toEqual([])
   })
+
+  describe('per-group windows (#501)', () => {
+    const at = (iso: string) => Date.parse(iso)
+    // Newest first, as the list hands them over: three recent Done, two old open sessions.
+    const sessions = [
+      makeSession('done1', { sessionStatus: 'done', lastMessageAt: at('2026-03-10T10:00:00.000Z') }),
+      makeSession('done2', { sessionStatus: 'done', lastMessageAt: at('2026-03-09T10:00:00.000Z') }),
+      makeSession('done3', { sessionStatus: 'done', lastMessageAt: at('2026-03-08T10:00:00.000Z') }),
+      makeSession('open1', { sessionStatus: 'in-progress', lastMessageAt: at('2026-02-01T10:00:00.000Z') }),
+      makeSession('open2', { sessionStatus: 'in-progress', lastMessageAt: at('2026-01-15T10:00:00.000Z') }),
+    ]
+
+    it('status grouping shows old open sessions and caps each group', () => {
+      const result = computeCollapsedPagination(sessions, 2, undefined, 'status')
+
+      expect(result.paginatedItems.map(s => s.id)).toEqual(['done1', 'done2', 'open1', 'open2'])
+      expect(result.hasMore).toBe(true)
+    })
+
+    it('reports no more items once every group fits', () => {
+      const result = computeCollapsedPagination(sessions, 3, undefined, 'status')
+
+      expect(result.paginatedItems).toHaveLength(5)
+      expect(result.hasMore).toBe(false)
+    })
+
+    it('unread grouping windows each group', () => {
+      const unread = sessions.map((s, i) => ({ ...s, hasUnread: i >= 3 }))
+      const result = computeCollapsedPagination(unread, 1, undefined, 'unread')
+
+      expect(result.paginatedItems.map(s => s.id)).toEqual(['done1', 'open1'])
+      expect(result.hasMore).toBe(true)
+    })
+
+    it('project grouping windows each group, sessions without a project included', () => {
+      const projects = sessions.map((s, i) => ({ ...s, projectId: i < 3 ? undefined : 'p1' }))
+      const result = computeCollapsedPagination(projects, 1, undefined, 'project')
+
+      expect(result.paginatedItems.map(s => s.id)).toEqual(['done1', 'open1'])
+    })
+
+    it('a collapsed group is counted, not windowed, and the rest stay per group', () => {
+      const result = computeCollapsedPagination(sessions, 1, new Set(['status-done']), 'status')
+
+      expect(result.paginatedItems.map(s => s.id)).toEqual(['open1'])
+      expect(result.collapsedGroupsMeta).toEqual([{ key: 'status-done', count: 3 }])
+      expect(result.hasMore).toBe(true)
+    })
+
+    it('date grouping keeps one global window', () => {
+      const result = computeCollapsedPagination(sessions, 2, undefined, 'date')
+
+      expect(result.paginatedItems.map(s => s.id)).toEqual(['done1', 'done2'])
+      expect(result.hasMore).toBe(true)
+    })
+  })
 })

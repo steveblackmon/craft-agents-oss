@@ -145,6 +145,15 @@ export interface SourcesChangedEvent {
 }
 
 /**
+ * Coding mode changed event (only before the conversation starts; see SessionManager.setSessionCodingMode)
+ */
+export interface CodingModeChangedEvent {
+  type: 'coding_mode_changed'
+  sessionId: string
+  codingMode: boolean
+}
+
+/**
  * Labels changed event
  */
 export interface LabelsChangedEvent {
@@ -545,6 +554,7 @@ export type AgentEvent =
   | PermissionRequestEvent
   | CredentialRequestEvent
   | SourcesChangedEvent
+  | CodingModeChangedEvent
   | LabelsChangedEvent
   | ProjectIdChangedEvent
   | SessionStatusChangedEvent
@@ -589,6 +599,7 @@ export type Effect =
   | { type: 'credential_request'; request: CredentialRequest }
   | { type: 'generate_title'; sessionId: string; userMessage: string }
   | { type: 'permission_mode_changed'; sessionId: string; permissionMode: PermissionMode; previousPermissionMode?: PermissionMode; transitionDisplay?: string; modeVersion?: number; changedAt?: string; changedBy?: 'user' | 'system' | 'restore' | 'automation' | 'unknown' }
+  | { type: 'coding_mode_changed'; sessionId: string; codingMode: boolean }
   | { type: 'restore_input'; text: string }
   | { type: 'toast_error'; message: string }
 

@@ -1,7 +1,5 @@
-import { formatDistanceToNowStrict } from "date-fns"
-import type { Locale } from "date-fns"
 import { useTranslation } from "react-i18next"
-import { AlertCircle, Flag, Hand } from "lucide-react"
+import { AlertCircle, CodeXml, Flag, Hand } from "lucide-react"
 import { useActionLabel } from "@/actions"
 import { cn } from "@/lib/utils"
 import { rendererPerf } from "@/lib/perf"
@@ -16,7 +14,7 @@ import { SessionBadges } from "./SessionBadges"
 import { SessionProjectColorWrapper } from "./SessionProjectColorWrapper"
 import { hasTransferTargets } from "./transfer-targets"
 import { useProjectColorTreatment } from "@/hooks/useProjectColorTreatment"
-import { getSessionTitle, getSessionPreviewText, highlightMatch, hasUnreadMeta, shortTimeLocale } from "@/utils/session"
+import { getSessionTitle, getSessionPreviewText, highlightMatch, hasUnreadMeta, formatShortAge } from "@/utils/session"
 import { useSessionListContext } from "@/context/SessionListContext"
 import { useAppShellContext } from "@/context/AppShellContext"
 import { navigate, routes } from "@/lib/navigate"
@@ -238,8 +236,11 @@ export function SessionItem({
       subtitle={subtitle}
       subtitleTrailing={hasLabels && !needsAttention ? <SessionBadges item={item} /> : undefined}
       titleSuffix={
-        (projectName || hasMessagingBinding) ? (
+        (projectName || hasMessagingBinding || item.codingMode) ? (
           <div className="flex items-center gap-1">
+            {item.codingMode && (
+              <CodeXml className="size-3.5 shrink-0 text-tertiary" aria-label={t("chat.codingMode.label")} />
+            )}
             {projectName && (
               // Revealed on hover/focus only, and out of the layout otherwise: an invisible (opacity-0)
               // name still reserved its width and cut the title short for nothing. Solved tertiary
@@ -277,7 +278,7 @@ export function SessionItem({
           {item.isFlagged ? (
             <Flag className="size-3.5 text-info" aria-label={t("sidebar.flagged")} />
           ) : item.lastMessageAt ? (
-            formatDistanceToNowStrict(new Date(item.lastMessageAt), { locale: shortTimeLocale as Locale, roundingMethod: 'floor' })
+            formatShortAge(item.lastMessageAt)
           ) : null}
         </span>
       ) : hasMatch ? (
@@ -291,7 +292,7 @@ export function SessionItem({
         <Flag className="size-3.5 text-info" aria-label={t("sidebar.flagged")} />
       ) : item.lastMessageAt ? (
         <span>
-          {formatDistanceToNowStrict(new Date(item.lastMessageAt), { locale: shortTimeLocale as Locale, roundingMethod: 'floor' })}
+          {formatShortAge(item.lastMessageAt)}
         </span>
       ) : undefined}
     />

@@ -563,6 +563,12 @@ export class ClaudeEventAdapter extends BaseEventAdapter {
       cacheCreationTokens: cacheCreation,
       costUsd: msg.total_cost_usd,
       contextWindow: primaryModelUsage?.contextWindow,
+      // `total_cost_usd` and `modelUsage` are running totals for the SDK session (subagents
+      // included), not this turn's spend; `usage` covers the main loop only.
+      runningTotals: {
+        costUsd: msg.total_cost_usd ?? 0,
+        outputTokens: modelUsageEntries.reduce((sum: number, entry: any) => sum + (entry?.outputTokens ?? 0), 0),
+      },
     };
 
     if (this.manualCompactionRequested) {
