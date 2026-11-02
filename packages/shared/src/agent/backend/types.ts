@@ -470,6 +470,20 @@ export interface AgentBackend {
    */
   isProcessing(): boolean;
 
+  /**
+   * Whether a turn is actually in flight. Differs from {@link isProcessing} for
+   * backends that keep a live query open between turns (Claude keep-alive),
+   * where `isProcessing()` stays true while the session is idle. Optional:
+   * callers fall back to `isProcessing()`.
+   */
+  isTurnInFlight?(): boolean;
+
+  /**
+   * Whether the backend still holds a live subprocess/query that background
+   * tasks could be running in. Optional: callers assume true when absent.
+   */
+  hasLiveQuery?(): boolean;
+
   // ============================================================
   // Model & Thinking Configuration
   // ============================================================

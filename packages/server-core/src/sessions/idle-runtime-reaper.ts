@@ -167,7 +167,12 @@ export class ArmedScheduleTracker {
     return false
   }
 
-  /** Schedules still armed at `nowMs`. Recurring crons always count. */
+  /** A scheduler call that errored armed nothing. */
+  noteResult(toolUseId: string, isError: boolean): void {
+    if (isError) this.schedules.delete(toolUseId)
+  }
+
+  /** Schedules still armed at `nowMs`. Crons (recurring or one-shot) count until a CronDelete. */
   countArmed(nowMs: number): number {
     let armed = 0
     for (const s of this.schedules.values()) {

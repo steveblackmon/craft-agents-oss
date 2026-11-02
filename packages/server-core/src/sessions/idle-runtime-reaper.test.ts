@@ -7,6 +7,7 @@ import {
   idleRuntimeSweepIntervalMs,
   resolveIdleRuntimeReapMinutes,
   type IdleReapCandidate,
+  type IdleReapSkipReason,
 } from './idle-runtime-reaper.ts'
 
 const MIN = 60_000
@@ -42,7 +43,7 @@ describe('evaluateIdleReap', () => {
   })
 
   // Every guard on its own must keep the runtime. Each row flips exactly one input.
-  const guards: Array<[string, Partial<IdleReapCandidate>, string]> = [
+  const guards: Array<[string, Partial<IdleReapCandidate>, IdleReapSkipReason]> = [
     ['no live runtime', { hasRuntime: false }, 'no-runtime'],
     ['idle less than the threshold', { lastActivityAt: NOW - 59 * MIN }, 'not-idle-long-enough'],
     ['activity after the sweep began (clock ahead)', { lastActivityAt: NOW + 1 }, 'not-idle-long-enough'],

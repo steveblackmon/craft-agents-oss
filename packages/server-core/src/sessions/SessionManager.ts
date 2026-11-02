@@ -981,6 +981,10 @@ interface ManagedSession {
   lastRuntimeActivityAt?: number
   /** Idle reaper: cron jobs / wakeups the live CLI armed (they die with it). Runtime-only. */
   armedSchedules?: ArmedScheduleTracker
+  /** Idle reaper: source rebuilds (setSessionSources / reloadSessionSources) in flight. Runtime-only. */
+  sourceUpdatesInFlight?: number
+  /** Idle reaper: "always allow" grants carried across a reap into the rebuilt agent. Runtime-only. */
+  preservedPermissionWhitelist?: { commands: string[]; domains: string[] }
 }
 
 const PI_SDK_MESSAGE_ID_CACHE_LIMIT = 256
@@ -1331,6 +1335,7 @@ export class SessionManager implements ISessionManager {
   private readonly idleRuntimeReapMinutes: number = resolveIdleRuntimeReapMinutes()
   private idleRuntimeReapTimer: ReturnType<typeof setInterval> | null = null
   private idleRuntimeSweepInFlight = false
+  private idleRuntimeReaperStopped = false
   /** Monotonic clock to ensure strictly increasing message timestamps */
   private lastTimestamp = 0
 
@@ -2345,13 +2350,28 @@ export class SessionManager implements ISessionManager {
    */
   private async reloadSessionSources(managed: ManagedSession): Promise<void> {
     if (!managed.agent) return  // No agent = nothing to update (fresh build on next message)
+    // Keep the idle reaper off this session while servers are rebuilt, and let an
+    // in-flight reap/refresh finish first; it may leave no agent to update.
+    managed.sourceUpdatesInFlight = (managed.sourceUpdatesInFlight ?? 0) + 1
+    try {
+      await this.agentRefreshLocks.get(managed.id)?.catch(() => undefined)
+      await this.applyReloadedSessionSources(managed)
+    } finally {
+      managed.sourceUpdatesInFlight = (managed.sourceUpdatesInFlight ?? 1) - 1
+      managed.lastRuntimeActivityAt = Date.now()
+    }
+  }
+
+  private async applyReloadedSessionSources(managed: ManagedSession): Promise<void> {
+    const agent = managed.agent
+    if (!agent) return
 
     const workspaceRootPath = managed.workspace.rootPath
     sessionLog.info(`Reloading sources for session ${managed.id}`)
 
     // Reload all sources from disk
     const allSources = loadAllSources(workspaceRootPath)
-    managed.agent.setAllSources(allSources)
+    agent.setAllSources(allSources)
 
     // Rebuild MCP and API servers for session's enabled sources
     const enabledSlugs = managed.enabledSourceSlugs || []
@@ -2360,10 +2380,12 @@ export class SessionManager implements ISessionManager {
     )
     // Pass session path so large API responses can be saved to session folder
     const sessionPath = getSessionStoragePath(workspaceRootPath, managed.id)
-    const { mcpServers, apiServers } = await buildServersFromSources(enabledSources, sessionPath, managed.tokenRefreshManager, managed.agent?.getSummarizeCallback())
+    const { mcpServers, apiServers } = await buildServersFromSources(enabledSources, sessionPath, managed.tokenRefreshManager, agent.getSummarizeCallback())
     const intendedSlugs = enabledSources.map(s => s.config.slug)
 
-    await managed.agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
+    // Runtime replaced meanwhile: the fresh build already read the sources from disk.
+    if (managed.agent !== agent) return
+    await agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
 
     sessionLog.info(`Sources reloaded for session ${managed.id}: ${Object.keys(mcpServers).length} MCP, ${Object.keys(apiServers).length} API`)
   }
@@ -3716,6 +3738,7 @@ export class SessionManager implements ISessionManager {
   }
 
   private stopIdleRuntimeReaper(): void {
+    this.idleRuntimeReaperStopped = true
     if (this.idleRuntimeReapTimer) clearInterval(this.idleRuntimeReapTimer)
     this.idleRuntimeReapTimer = null
   }
@@ -3726,16 +3749,27 @@ export class SessionManager implements ISessionManager {
     for (const meta of this.pendingPermissionRequests.values()) {
       if (meta.sessionId === managed.id) pendingPermissions++
     }
-    let runningBackgroundTasks = 0
-    for (const task of managed.backgroundTaskRegistry.values()) {
-      // Any kind, tracked or not: a shell, monitor, agent or workflow dies with the CLI.
-      if (task.status === 'running') runningBackgroundTasks++
-    }
     let agentProcessing = false
+    let liveQuery = true
     try {
-      agentProcessing = managed.agent?.isProcessing() === true
+      const agent = managed.agent
+      if (agent) {
+        // Claude keep-alive holds the query open between turns, so isProcessing() is
+        // true while idle; isTurnInFlight() is the real "a turn is running" signal.
+        agentProcessing = agent.isTurnInFlight ? agent.isTurnInFlight() : agent.isProcessing()
+        liveQuery = agent.hasLiveQuery ? agent.hasLiveQuery() : true
+      }
     } catch {
       agentProcessing = true
+    }
+    let runningBackgroundTasks = 0
+    // Once the CLI is gone, `running` entries are stale (their completion can never
+    // arrive); they must not pin the runtime forever.
+    if (liveQuery) {
+      for (const task of managed.backgroundTaskRegistry.values()) {
+        // Any kind, tracked or not: a shell, monitor, agent or workflow dies with the CLI.
+        if (task.status === 'running') runningBackgroundTasks++
+      }
     }
     return {
       hasRuntime: !!(managed.agent || managed.poolServer || managed.mcpPool),
@@ -3745,7 +3779,8 @@ export class SessionManager implements ISessionManager {
         || !!managed.authRetryInProgress
         || managed.autoRetryTimer !== undefined
         || managed.pendingActivationResend !== undefined
-        || this.agentRefreshLocks.has(managed.id),
+        || this.agentRefreshLocks.has(managed.id)
+        || (managed.sourceUpdatesInFlight ?? 0) > 0,
       queuedMessages: managed.messageQueue.length,
       pendingPermissions,
       pendingAuth: !!(managed.pendingAuthRequestId || managed.pendingAuthRequest),
@@ -3790,10 +3825,11 @@ export class SessionManager implements ISessionManager {
   async sweepIdleRuntimes(nowMs: number = Date.now()): Promise<{ reaped: string[]; blocked: Partial<Record<IdleReapSkipReason, number>> }> {
     const result: { reaped: string[]; blocked: Partial<Record<IdleReapSkipReason, number>> } = { reaped: [], blocked: {} }
     const thresholdMs = this.idleRuntimeReapMinutes * 60_000
-    if (!(thresholdMs > 0) || this.idleRuntimeSweepInFlight) return result
+    if (!(thresholdMs > 0) || this.idleRuntimeSweepInFlight || this.idleRuntimeReaperStopped) return result
     this.idleRuntimeSweepInFlight = true
     try {
       for (const managed of [...this.sessions.values()]) {
+        if (this.idleRuntimeReaperStopped) break  // cleanup() ran mid-sweep
         // Cheap synchronous pass first; only idle-enough candidates pay for the browser query.
         const pre = evaluateIdleReap(this.buildIdleReapCandidate(managed, false, nowMs), nowMs, thresholdMs)
         if (!pre.reap) {
@@ -3835,6 +3871,19 @@ export class SessionManager implements ISessionManager {
     const hadCli = !!managed.agent
     const mcpSources = managed.mcpPool?.getConnectedSlugs().length ?? 0
     const hadPoolServer = !!managed.poolServer
+    // "Always allow" grants live only in the agent's PermissionManager; carry them
+    // into the rebuilt agent so the user isn't re-prompted after a reap.
+    try {
+      const pm = (managed.agent as { getPermissionManager?: () => { getWhitelistedCommands(): Set<string>; getWhitelistedDomains(): Set<string> } } | null)?.getPermissionManager?.()
+      if (pm) {
+        const commands = [...pm.getWhitelistedCommands()]
+        const domains = [...pm.getWhitelistedDomains()]
+        if (commands.length > 0 || domains.length > 0) managed.preservedPermissionWhitelist = { commands, domains }
+      }
+    } catch (error) {
+      sessionLog.warn(`[idle-reap] could not read permission grants for ${managed.id}; keeping runtime: ${error instanceof Error ? error.message : error}`)
+      return false
+    }
     const work = this.disposeManagedAgentRuntime(managed, 'idle-reap')
     const tracked = work.then(() => undefined, () => undefined)
     this.agentRefreshLocks.set(managed.id, tracked)
@@ -4347,6 +4396,17 @@ export class SessionManager implements ISessionManager {
       }) as AgentInstance
 
       sessionLog.info(`Created ${provider} agent for session ${managed.id} (model: ${backendContext.resolvedModel})${managed.sdkSessionId ? ' (resuming)' : ''}`)
+
+      // Re-apply "always allow" grants an idle reap carried over from the previous agent.
+      const preserved = managed.preservedPermissionWhitelist
+      if (preserved) {
+        managed.preservedPermissionWhitelist = undefined
+        const pm = (managed.agent as { getPermissionManager?: () => { whitelistCommand(c: string): void; whitelistDomain(d: string): void } }).getPermissionManager?.()
+        if (pm) {
+          for (const command of preserved.commands) pm.whitelistCommand(command)
+          for (const domain of preserved.domains) pm.whitelistDomain(domain)
+        }
+      }
 
       // ============================================================
       // Post-construction: debug callback, auth callback, postInit()
@@ -5914,6 +5974,18 @@ export class SessionManager implements ISessionManager {
       throw new Error(`Session not found: ${sessionId}`)
     }
 
+    // Keep the idle reaper off this session while servers are rebuilt.
+    managed.sourceUpdatesInFlight = (managed.sourceUpdatesInFlight ?? 0) + 1
+    try {
+      await this.applySessionSources(managed, sourceSlugs)
+    } finally {
+      managed.sourceUpdatesInFlight = (managed.sourceUpdatesInFlight ?? 1) - 1
+      managed.lastRuntimeActivityAt = Date.now()
+    }
+  }
+
+  private async applySessionSources(managed: ManagedSession, sourceSlugs: string[]): Promise<void> {
+    const sessionId = managed.id
     const workspaceRootPath = managed.workspace.rootPath
     sessionLog.info(`Setting sources for session ${sessionId}:`, sourceSlugs)
 
@@ -5933,26 +6005,34 @@ export class SessionManager implements ISessionManager {
     // Store the selection
     managed.enabledSourceSlugs = sourceSlugs
 
+    // An in-flight reap/refresh finishes first; it may leave no agent to update
+    // (the next message's fresh build reads enabledSourceSlugs).
+    await this.agentRefreshLocks.get(sessionId)?.catch(() => undefined)
+
     // If agent exists, build and apply servers immediately
-    if (managed.agent) {
+    const agent = managed.agent
+    if (agent) {
       const sources = getSourcesBySlugs(workspaceRootPath, sourceSlugs)
       // Pass session path so large API responses can be saved to session folder
       const sessionPath = getSessionStoragePath(workspaceRootPath, sessionId)
-      const { mcpServers, apiServers, errors } = await buildServersFromSources(sources, sessionPath, managed.tokenRefreshManager, managed.agent.getSummarizeCallback())
+      const { mcpServers, apiServers, errors } = await buildServersFromSources(sources, sessionPath, managed.tokenRefreshManager, agent.getSummarizeCallback())
       if (errors.length > 0) {
         sessionLog.warn(`Source build errors:`, errors)
       }
 
-      // Set all sources for context (agent sees full list with descriptions, including built-ins)
-      const allSources = loadAllSources(workspaceRootPath)
-      managed.agent.setAllSources(allSources)
+      // Runtime replaced meanwhile: skip applying to the stale agent.
+      if (managed.agent === agent) {
+        // Set all sources for context (agent sees full list with descriptions, including built-ins)
+        const allSources = loadAllSources(workspaceRootPath)
+        agent.setAllSources(allSources)
 
-      // Set active source servers (tools are only available from these)
-      const intendedSlugs = sources.filter(isSourceUsable).map(s => s.config.slug)
+        // Set active source servers (tools are only available from these)
+        const intendedSlugs = sources.filter(isSourceUsable).map(s => s.config.slug)
 
-      await managed.agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
+        await agent.setSourceServers(mcpServers, apiServers, intendedSlugs)
 
-      sessionLog.info(`Applied ${Object.keys(mcpServers).length} MCP + ${Object.keys(apiServers).length} API sources to active agent (${allSources.length} total)`)
+        sessionLog.info(`Applied ${Object.keys(mcpServers).length} MCP + ${Object.keys(apiServers).length} API sources to active agent (${allSources.length} total)`)
+      }
     }
 
     // Persist the session with updated sources
@@ -8879,6 +8959,7 @@ export class SessionManager implements ISessionManager {
       }
 
       case 'tool_result': {
+        managed.armedSchedules?.noteResult(event.toolUseId, event.isError)
         // toolName comes directly from CraftAgent (resolved via ToolIndex)
         const toolName = event.toolName || 'unknown'
 
