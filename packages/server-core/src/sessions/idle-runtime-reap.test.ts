@@ -176,6 +176,42 @@ describe('SessionManager.sweepIdleRuntimes', () => {
     expect((await sm.sweepIdleRuntimes(NOW)).blocked).toEqual({ 'live-browser': 1 })
   })
 
+  it('remote browser bridge: no desktop client that could host a browser means no live browser', async () => {
+    injectIdleSession(sm, 'headless', tmpRoot)
+    ;(sm as any).rpcServer = {
+      hasClientCapability: () => false,
+      findClientsWithCapability: () => [],
+    }
+    expect((await sm.sweepIdleRuntimes(NOW)).reaped).toEqual(['headless'])
+  })
+
+  it('remote browser bridge: asks the host client and keeps a session it reports a browser for', async () => {
+    injectIdleSession(sm, 'remote-browsing', tmpRoot)
+    injectIdleSession(sm, 'remote-idle', tmpRoot)
+    ;(sm as any).rpcServer = {
+      hasClientCapability: () => true,
+      findClientsWithCapability: () => ['desktop-1'],
+    }
+    ;(sm as any).getBrowserPaneManagerForSession = () => ({
+      listInstancesAsync: async () => [{ id: 'b1', ownerSessionId: 'remote-browsing', boundSessionId: null }],
+    })
+    const result = await sm.sweepIdleRuntimes(NOW)
+    expect(result.reaped).toEqual(['remote-idle'])
+    expect(result.blocked).toEqual({ 'live-browser': 1 })
+  })
+
+  it('remote browser bridge: a failing host query keeps the runtime (unknown)', async () => {
+    injectIdleSession(sm, 'remote-err', tmpRoot)
+    ;(sm as any).rpcServer = {
+      hasClientCapability: () => true,
+      findClientsWithCapability: () => ['desktop-1'],
+    }
+    ;(sm as any).getBrowserPaneManagerForSession = () => ({
+      listInstancesAsync: async () => { throw new Error('client gone') },
+    })
+    expect((await sm.sweepIdleRuntimes(NOW)).blocked).toEqual({ 'live-browser': 1 })
+  })
+
   it('keeps a session whose CLI armed a cron (seen via tool_start), reaps after CronDelete', async () => {
     const { managed } = injectIdleSession(sm, 'looping', tmpRoot)
     const pe = (sm as any).processEvent.bind(sm)
