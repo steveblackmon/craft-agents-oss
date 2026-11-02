@@ -124,6 +124,9 @@ describe('SessionManager.sweepIdleRuntimes', () => {
     ['running background shell', (_sm, m) => { m.backgroundTaskRegistry.set('t1', { taskId: 't1', startTime: NOW, status: 'running', kind: 'shell' }) }, 'background-task'],
     ['running background monitor/task', (_sm, m) => { m.backgroundTaskRegistry.set('t2', { taskId: 't2', startTime: NOW, status: 'running', kind: 'task' }) }, 'background-task'],
     ['running untracked sub-agent task', (_sm, m) => { m.backgroundTaskRegistry.set('t3', { taskId: 't3', startTime: NOW, status: 'running', untracked: true }) }, 'background-task'],
+    ['backend turn in flight (keep-alive aware)', (_sm, m) => { m.agent.isTurnInFlight = () => true }, 'processing'],
+    ['backend processing check throws', (_sm, m) => { m.agent.isProcessing = () => { throw new Error('x') } }, 'processing'],
+    ['source update in flight', (_sm, m) => { m.sourceUpdatesInFlight = 1 }, 'transition-in-flight'],
   ]
   for (const [label, arrange, reason] of guards) {
     it(`keeps the runtime when: ${label}`, async () => {
@@ -136,6 +139,81 @@ describe('SessionManager.sweepIdleRuntimes', () => {
       expect(managed.mcpPool).toBeDefined()
     })
   }
+
+  it('reaps an idle keep-alive Claude agent: isProcessing() true between turns, isTurnInFlight() false', async () => {
+    const { managed, stubs } = injectIdleSession(sm, 'keepalive', tmpRoot)
+    managed.agent.isProcessing = () => true
+    managed.agent.isTurnInFlight = () => false
+    expect((await sm.sweepIdleRuntimes(NOW)).reaped).toEqual(['keepalive'])
+    expect(stubs.agentDisposed).toBe(1)
+  })
+
+  it('a "running" task whose CLI is already gone does not pin the runtime', async () => {
+    const { managed } = injectIdleSession(sm, 'dead-cli', tmpRoot)
+    managed.agent.hasLiveQuery = () => false
+    managed.backgroundTaskRegistry.set('t1', { taskId: 't1', startTime: NOW - 90 * MIN, status: 'running', kind: 'shell' })
+    expect((await sm.sweepIdleRuntimes(NOW)).reaped).toEqual(['dead-cli'])
+  })
+
+  it('a running task in a live CLI keeps the runtime (hasLiveQuery true)', async () => {
+    const { managed } = injectIdleSession(sm, 'live-cli', tmpRoot)
+    managed.agent.hasLiveQuery = () => true
+    managed.backgroundTaskRegistry.set('t1', { taskId: 't1', startTime: NOW, status: 'running', kind: 'shell' })
+    expect((await sm.sweepIdleRuntimes(NOW)).blocked).toEqual({ 'background-task': 1 })
+  })
+
+  it('an errored CronCreate (tool_result isError) arms nothing', async () => {
+    const { managed } = injectIdleSession(sm, 'cron-failed', tmpRoot)
+    const pe = (sm as any).processEvent.bind(sm)
+    await pe(managed, { type: 'tool_start', toolName: 'CronCreate', toolUseId: 'c1', input: { cron: 'bad' } })
+    await pe(managed, { type: 'tool_result', toolUseId: 'c1', toolName: 'CronCreate', result: 'invalid cron', isError: true })
+    managed.lastRuntimeActivityAt = NOW - 61 * MIN
+    expect((await sm.sweepIdleRuntimes(NOW)).reaped).toEqual(['cron-failed'])
+  })
+
+  for (const which of ['setSessionSources', 'reloadSessionSources'] as const) {
+    it(`${which} racing a reap neither throws nor touches the half-disposed runtime`, async () => {
+      const { managed } = injectIdleSession(sm, 'src-race', tmpRoot, { disposeDelayMs: 30 })
+      const oldAgent = managed.agent
+      let applied = 0
+      oldAgent.setAllSources = () => { applied++ }
+      oldAgent.setSourceServers = async () => { applied++ }
+      oldAgent.getSummarizeCallback = () => undefined
+      const sweep = sm.sweepIdleRuntimes(NOW)
+      await new Promise(r => setTimeout(r, 5)) // reap is mid-dispose, holding the lock
+      const update = which === 'setSessionSources'
+        ? sm.setSessionSources('src-race', [])
+        : (sm as any).reloadSessionSources(managed)
+      await expect(update).resolves.toBeUndefined()
+      expect((await sweep).reaped).toEqual(['src-race'])
+      expect(applied).toBe(0)
+      expect(managed.agent).toBeNull()
+      expect(managed.sourceUpdatesInFlight).toBe(0)
+    })
+
+    it(`${which} in flight keeps the reaper off the session`, async () => {
+      const { managed } = injectIdleSession(sm, 'src-busy', tmpRoot)
+      let release!: () => void
+      managed.agent.setAllSources = () => {}
+      managed.agent.getSummarizeCallback = () => undefined
+      managed.agent.setSourceServers = () => new Promise<void>(r => { release = r })
+      const update = which === 'setSessionSources'
+        ? sm.setSessionSources('src-busy', [])
+        : (sm as any).reloadSessionSources(managed)
+      await new Promise(r => setTimeout(r, 5))
+      expect(managed.sourceUpdatesInFlight).toBe(1)
+      expect((await sm.sweepIdleRuntimes(NOW)).blocked).toEqual({ 'transition-in-flight': 1 })
+      release()
+      await update
+      expect(managed.sourceUpdatesInFlight).toBe(0)
+    })
+  }
+
+  it('stops sweeping after cleanup()', async () => {
+    injectIdleSession(sm, 'after-cleanup', tmpRoot)
+    sm.cleanup()
+    expect((await sm.sweepIdleRuntimes(NOW)).reaped).toEqual([])
+  })
 
   it('does not count a pending permission belonging to another session', async () => {
     injectIdleSession(sm, 'mine', tmpRoot)

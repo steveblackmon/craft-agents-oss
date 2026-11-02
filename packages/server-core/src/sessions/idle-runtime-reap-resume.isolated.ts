@@ -30,11 +30,27 @@ afterEach(() => {
   for (const spy of spies.splice(0)) spy.mockRestore()
 })
 
+/** Minimal PermissionManager whitelist surface. */
+function stubPermissionManager() {
+  const commands = new Set<string>()
+  const domains = new Set<string>()
+  return {
+    commands,
+    domains,
+    whitelistCommand: (c: string) => { commands.add(c) },
+    whitelistDomain: (d: string) => { domains.add(d) },
+    getWhitelistedCommands: () => new Set(commands),
+    getWhitelistedDomains: () => new Set(domains),
+  }
+}
+
 /** Agent stub: every method is a no-op, `isProcessing` is false. */
 function stubAgent(onDispose: () => void) {
+  const pm = stubPermissionManager()
   const target: Record<string, unknown> = {
     isProcessing: () => false,
     dispose: onDispose,
+    getPermissionManager: () => pm,
     postInit: async () => ({}),
   }
   return new Proxy(target, {
@@ -91,6 +107,76 @@ describe('idle reap → next turn resumes the same SDK session', () => {
       // A fresh runtime is fresh activity and starts with no armed schedules.
       expect(managed.lastRuntimeActivityAt).toBeGreaterThan(Date.now() - 60_000)
       expect(managed.armedSchedules?.countArmed(Date.now())).toBe(0)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+  it('carries "always allow" grants across the reap into the rebuilt agent', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sm-idle-grants-'))
+    try {
+      const agents: any[] = []
+      spies.push(spyOn(backend, 'createBackendFromResolvedContext').mockImplementation((() => {
+        const a = stubAgent(() => {})
+        agents.push(a)
+        return a
+      }) as never))
+      const sm = new SessionManager()
+      const workspace = { id: 'ws_test', name: 'Test', rootPath: root, createdAt: Date.now() }
+      const managed = createManagedSession({ id: 'grants', name: 'grants' }, workspace as never, { messagesLoaded: true }) as any
+      ;(sm as any).sessions.set(managed.id, managed)
+
+      await (sm as any).getOrCreateAgent(managed)
+      agents[0].getPermissionManager().whitelistCommand('kubectl')
+      agents[0].getPermissionManager().whitelistDomain('example.com')
+
+      managed.lastRuntimeActivityAt = Date.now() - 61 * 60_000
+      expect((await sm.sweepIdleRuntimes(Date.now())).reaped).toEqual(['grants'])
+      await (sm as any).getOrCreateAgent(managed)
+
+      expect(agents).toHaveLength(2)
+      const pm = agents[1].getPermissionManager()
+      expect([...pm.commands]).toEqual(['kubectl'])
+      expect([...pm.domains]).toEqual(['example.com'])
+      expect(managed.preservedPermissionWhitelist).toBeUndefined()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  it('a message arriving mid-reap rebuilds only after teardown finishes, with a new pool', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'sm-idle-race-'))
+    try {
+      const order: string[] = []
+      spies.push(spyOn(backend, 'createBackendFromResolvedContext').mockImplementation((() => {
+        order.push('create')
+        return stubAgent(() => {})
+      }) as never))
+      const sm = new SessionManager()
+      const workspace = { id: 'ws_test', name: 'Test', rootPath: root, createdAt: Date.now() }
+      const managed = createManagedSession({ id: 'race', name: 'race' }, workspace as never, { messagesLoaded: true }) as any
+      ;(sm as any).sessions.set(managed.id, managed)
+      await (sm as any).getOrCreateAgent(managed)
+      order.length = 0
+      const firstPool = managed.mcpPool
+      // Slow teardown so the "message" lands in the middle of it.
+      const realDisconnect = firstPool.disconnectAll.bind(firstPool)
+      firstPool.disconnectAll = async () => {
+        await new Promise(r => setTimeout(r, 40))
+        await realDisconnect()
+        order.push('disposed')
+      }
+
+      managed.lastRuntimeActivityAt = Date.now() - 61 * 60_000
+      const sweep = sm.sweepIdleRuntimes(Date.now())
+      await new Promise(r => setTimeout(r, 5))
+      // The send path: sendMessage → getOrCreateAgent.
+      const send = (sm as any).getOrCreateAgent(managed)
+      await Promise.all([sweep, send])
+
+      expect(order).toEqual(['disposed', 'create'])
+      expect(managed.agent).not.toBeNull()
+      expect(managed.mcpPool).toBeInstanceOf(McpClientPool)
+      expect(managed.mcpPool).not.toBe(firstPool)
     } finally {
       rmSync(root, { recursive: true, force: true })
     }

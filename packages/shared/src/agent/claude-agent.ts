@@ -3230,7 +3230,7 @@ This is a branched conversation. All prior messages in this conversation are par
    * is false between turns while keep-alive holds the persistent query open.
    */
   isTurnInFlight(): boolean {
-    if (this.activeTurnChannel !== null || this.stoppedTurn !== null) return true;
+    if (this.activeTurnChannel || this.stoppedTurn) return true;
     if (this.isCompactionInFlight()) return true;
     if (this.keepBackgroundTasksAlive && this.persistentInput) return false;
     return this.currentQuery !== null;
