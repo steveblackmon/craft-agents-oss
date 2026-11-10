@@ -34,7 +34,7 @@ LABEL org.opencontainers.image.licenses="Apache-2.0"
 # upgrades are explicit — must match the --target in scripts/build-wa-worker.ts.
 ARG NODE_MAJOR=20
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates git ripgrep curl gnupg && \
+    apt-get install -y --no-install-recommends ca-certificates git ripgrep curl gnupg tini && \
     curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
@@ -114,4 +114,7 @@ ENV CRAFT_MESSAGING_NODE_BIN=node
 
 EXPOSE 9100
 
-ENTRYPOINT ["bun", "run", "packages/server/src/index.ts"]
+# tini runs as PID 1 so orphaned grandchildren (e.g. `git` spawned by agent
+# tools) get reaped. Bun does not reap adopted children, so without an init
+# they accumulate as <defunct> zombies until the container restarts.
+ENTRYPOINT ["/usr/bin/tini", "--", "bun", "run", "packages/server/src/index.ts"]
