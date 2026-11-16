@@ -190,3 +190,105 @@ export class ArmedScheduleTracker {
     return armed
   }
 }
+
+// ---------------------------------------------------------------------------
+// Idle transcript release
+// ---------------------------------------------------------------------------
+//
+// A session's transcript is lazy-loaded from its session.jsonl on first access
+// and, without this, stays in the heap until the server restarts, so heap grows
+// with every session touched since boot (storeminder-ai/craft-agents#248: 1.5 GB+
+// after ~4 days, ~300 sessions). Releasing puts the session back in exactly the
+// state startup leaves it in (`messagesLoaded: false`, `messages: []`). Every
+// later read goes through the existing lazy-load paths (getSession,
+// ensureMessagesLoaded, the cold-persist hydrate), which reload it from disk.
+
+export const IDLE_MESSAGE_RELEASE_ENV = 'CRAFT_IDLE_MESSAGE_RELEASE'
+
+/** Release is on unless `CRAFT_IDLE_MESSAGE_RELEASE` is `0`/`false`/`off`. It reuses the reaper's threshold. */
+export function resolveIdleMessageReleaseEnabled(env: Record<string, string | undefined> = process.env): boolean {
+  const raw = env[IDLE_MESSAGE_RELEASE_ENV]?.trim().toLowerCase()
+  return !(raw === '0' || raw === 'false' || raw === 'off')
+}
+
+/** No release within this long of the last persist enqueue: the debounced write may still be landing. */
+export const MESSAGE_RELEASE_PERSIST_QUIET_MS = 60_000
+
+/** Everything the release predicate looks at, gathered from a ManagedSession. */
+export interface IdleMessageReleaseCandidate {
+  messagesLoaded: boolean
+  /** Agent, pool server or MCP pool is live. The runtime reaper goes first. */
+  hasRuntime: boolean
+  isProcessing: boolean
+  /** Stop requested, auth retry, auto-retry, runtime refresh or source rebuild in flight. */
+  transitionInFlight: boolean
+  queuedMessages: number
+  pendingPermissions: number
+  pendingAuth: boolean
+  pendingPlan: boolean
+  /** A lazy load of this session's messages is in flight. */
+  loadInFlight: boolean
+  /** The persistence queue still holds an unwritten snapshot. */
+  persistPending: boolean
+  /** In-memory messages still flagged isQueued (a reload would re-queue and replay them). */
+  queuedInTranscript: number
+  /**
+   * The on-disk header's messageCount equals the persistable in-memory count.
+   * `false` = disk is missing or behind, so releasing would lose messages.
+   */
+  diskInSync: boolean
+  /** ms of the last turn/runtime activity, falling back to lastMessageAt. */
+  lastActivityAt: number
+  /** ms of the last getSession() read (a client opened the transcript). */
+  lastAccessAt?: number
+  /** ms of the last persist enqueue. */
+  lastPersistAt?: number
+}
+
+export type IdleMessageReleaseSkipReason =
+  | 'not-loaded'
+  | 'has-runtime'
+  | 'processing'
+  | 'transition-in-flight'
+  | 'queued-messages'
+  | 'pending-permission'
+  | 'pending-auth'
+  | 'pending-plan'
+  | 'load-in-flight'
+  | 'persist-pending'
+  | 'queued-in-transcript'
+  | 'disk-out-of-sync'
+  | 'not-idle-long-enough'
+
+export type IdleMessageReleaseDecision =
+  | { release: true; idleMs: number }
+  | { release: false; reason: IdleMessageReleaseSkipReason; idleMs: number }
+
+/**
+ * Pure release predicate. Release iff messages are loaded, there is no live
+ * runtime, nothing is running, queued or pending, disk holds everything that
+ * memory holds, and the session has been idle (no activity, client read or
+ * persist) for at least `thresholdMs`. `thresholdMs <= 0` never releases.
+ */
+export function evaluateIdleMessageRelease(c: IdleMessageReleaseCandidate, nowMs: number, thresholdMs: number): IdleMessageReleaseDecision {
+  const lastTouch = Math.max(c.lastActivityAt, c.lastAccessAt ?? 0, c.lastPersistAt ?? 0)
+  const idleMs = Math.max(0, nowMs - lastTouch)
+  const skip = (reason: IdleMessageReleaseSkipReason): IdleMessageReleaseDecision => ({ release: false, reason, idleMs })
+  if (!c.messagesLoaded) return skip('not-loaded')
+  if (c.hasRuntime) return skip('has-runtime')
+  if (c.isProcessing) return skip('processing')
+  if (c.transitionInFlight) return skip('transition-in-flight')
+  if (c.queuedMessages > 0) return skip('queued-messages')
+  if (c.pendingPermissions > 0) return skip('pending-permission')
+  if (c.pendingAuth) return skip('pending-auth')
+  if (c.pendingPlan) return skip('pending-plan')
+  if (c.loadInFlight) return skip('load-in-flight')
+  if (c.persistPending) return skip('persist-pending')
+  if (c.lastPersistAt !== undefined && nowMs - c.lastPersistAt < MESSAGE_RELEASE_PERSIST_QUIET_MS) return skip('persist-pending')
+  if (c.queuedInTranscript > 0) return skip('queued-in-transcript')
+  if (!(thresholdMs > 0) || idleMs < thresholdMs) return skip('not-idle-long-enough')
+  // Checked last: it is the only input that costs disk I/O, so callers may pass `true` for a
+  // cheap pre-pass and re-evaluate with the real value once everything else allows a release.
+  if (!c.diskInSync) return skip('disk-out-of-sync')
+  return { release: true, idleMs }
+}
