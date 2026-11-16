@@ -201,6 +201,17 @@ export class McpClientPool {
   /** Active MCP clients keyed by source slug */
   private clients = new Map<string, PoolClient>();
 
+  /**
+   * Connection epochs (craft-agents#250). A connect spans an await (spawn + handshake); if the
+   * pool or the slug is disconnected meanwhile, or another connect registers the slug first, the
+   * late client must be closed, not registered over it. Otherwise its process (a stdio MCP
+   * server) is left running with nothing referencing it.
+   */
+  private poolEpoch = 0;
+  private slugEpochs = new Map<string, number>();
+  /** In-flight connects, so concurrent connects of one slug share one client. */
+  private connecting = new Map<string, Promise<void>>();
+
   /** Configs used for active MCP connections (for change detection during sync) */
   protected activeConfigs = new Map<string, SdkMcpServerConfig>();
 
@@ -257,9 +268,27 @@ export class McpClientPool {
    * Register a client: connect, cache tools, build proxy mappings.
    * Shared logic for both remote MCP and in-process API sources.
    */
-  protected async registerClient(slug: string, client: PoolClient): Promise<void> {
+  /**
+   * Connect `client` and register it under `slug`. Returns false (and closes the client) when it
+   * was superseded while connecting: the pool or slug was disconnected, or another client already
+   * holds the slug. A client whose connect fails is closed too.
+   */
+  protected async registerClient(slug: string, client: PoolClient): Promise<boolean> {
+    const poolEpoch = this.poolEpoch;
+    const slugEpoch = this.slugEpochs.get(slug) ?? 0;
     // listTools() triggers connect() internally for both CraftMcpClient and ApiSourcePoolClient
-    const tools = await client.listTools();
+    let tools: Tool[];
+    try {
+      tools = await client.listTools();
+    } catch (error) {
+      await client.close().catch(() => {});
+      throw error;
+    }
+    if (this.poolEpoch !== poolEpoch || (this.slugEpochs.get(slug) ?? 0) !== slugEpoch || this.clients.has(slug)) {
+      await client.close().catch(() => {});
+      this.debug(`Discarded late connection for ${slug}: superseded while connecting`);
+      return false;
+    }
     this.clients.set(slug, client);
     this.toolCache.set(slug, tools);
 
@@ -293,6 +322,7 @@ export class McpClientPool {
     this.featureProbes.set(slug, probe);
 
     this.debug(`Connected source ${slug}: ${tools.length} tools`);
+    return true;
   }
 
   /** Resolves once the source's feature probe (started at connect) has finished. */
@@ -344,13 +374,24 @@ export class McpClientPool {
    */
   async connect(slug: string, config: SdkMcpServerConfig): Promise<void> {
     if (this.clients.has(slug)) return;
+    const inFlight = this.connecting.get(slug);
+    if (inFlight) return inFlight;
     const clientConfig = sdkConfigToClientConfig(config);
     if (!clientConfig) {
       this.debug(`Unknown MCP server type for ${slug}: ${(config as { type: string }).type}`);
       return;
     }
-    await this.registerClient(slug, new CraftMcpClient(clientConfig));
-    this.activeConfigs.set(slug, config);
+    const attempt = (async () => {
+      if (await this.registerClient(slug, new CraftMcpClient(clientConfig))) {
+        this.activeConfigs.set(slug, config);
+      }
+    })();
+    this.connecting.set(slug, attempt);
+    try {
+      await attempt;
+    } finally {
+      if (this.connecting.get(slug) === attempt) this.connecting.delete(slug);
+    }
   }
 
   /**
@@ -390,6 +431,10 @@ export class McpClientPool {
    * Disconnect a source and remove its tools from the pool.
    */
   async disconnect(slug: string): Promise<void> {
+    // A connect still in flight belongs to the old epoch and will be discarded: new connects
+    // must not join it.
+    this.slugEpochs.set(slug, (this.slugEpochs.get(slug) ?? 0) + 1);
+    this.connecting.delete(slug);
     const client = this.clients.get(slug);
     if (client) {
       await client.close().catch(() => {});
@@ -410,6 +455,8 @@ export class McpClientPool {
    * Disconnect all sources and clear all state.
    */
   async disconnectAll(): Promise<void> {
+    this.poolEpoch++;
+    this.connecting.clear();
     const closePromises = Array.from(this.clients.values()).map(c => c.close().catch(() => {}));
     await Promise.all(closePromises);
     this.clients.clear();
