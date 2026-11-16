@@ -125,7 +125,7 @@ import { loadStatusConfig } from '@craft-agent/shared/statuses/storage'
 import { AutomationSystem, createPromptHistoryEntry, appendAutomationHistoryEntry, type AutomationSystemMetadataSnapshot, type PendingPrompt } from '@craft-agent/shared/automations'
 import { buildBackendRuntimeSignature, buildRestartRequiredSignature, filterAttachmentsForModelInput } from './runtime-config'
 import { validateArchiveTarget } from './archive-guards'
-import { ArmedScheduleTracker, evaluateIdleReap, idleRuntimeSweepIntervalMs, resolveIdleRuntimeReapMinutes, IDLE_RUNTIME_REAP_ENV, type IdleReapCandidate, type IdleReapSkipReason } from './idle-runtime-reaper'
+import { ArmedScheduleTracker, evaluateIdleReap, idleRuntimeSweepIntervalMs, resolveIdleRuntimeReapMinutes, IDLE_RUNTIME_REAP_ENV, type IdleReapCandidate, type IdleReapSkipReason, evaluateIdleMessageRelease, resolveIdleMessageReleaseEnabled, IDLE_MESSAGE_RELEASE_ENV, type IdleMessageReleaseCandidate, type IdleMessageReleaseSkipReason } from './idle-runtime-reaper'
 import { spawnedSessionOptions } from './spawn-options'
 import { addTurnUsage, branchStartTotals, type BranchParent } from './turn-usage'
 
@@ -1008,6 +1008,10 @@ interface ManagedSession {
   sourceUpdatesInFlight?: number
   /** Idle reaper: "always allow" grants carried across a reap into the rebuilt agent. Runtime-only. */
   preservedPermissionWhitelist?: { commands: string[]; domains: string[] }
+  /** Idle message release: ms of the last getSession() read of the transcript. Runtime-only. */
+  lastMessagesAccessAt?: number
+  /** Idle message release: ms of the last persist enqueue. Runtime-only. */
+  lastPersistEnqueuedAt?: number
 }
 
 const PI_SDK_MESSAGE_ID_CACHE_LIMIT = 256
@@ -1393,6 +1397,8 @@ export class SessionManager implements ISessionManager {
   private agentRefreshLocks: Map<string, Promise<void>> = new Map()
   /** Idle runtime reaper threshold (`CRAFT_IDLE_RUNTIME_REAP_MINUTES`, default 60, 0 = off). */
   private readonly idleRuntimeReapMinutes: number = resolveIdleRuntimeReapMinutes()
+  /** Idle message release (`CRAFT_IDLE_MESSAGE_RELEASE`, default on; shares the reaper's threshold). */
+  private readonly idleMessageReleaseEnabled: boolean = resolveIdleMessageReleaseEnabled()
   private idleRuntimeReapTimer: ReturnType<typeof setInterval> | null = null
   private idleRuntimeSweepInFlight = false
   private idleRuntimeReaperStopped = false
@@ -2823,6 +2829,7 @@ export class SessionManager implements ISessionManager {
   // Build the StoredSession snapshot and hand it to the persistence queue.
   // Caller must ensure `managed.messagesLoaded` is true.
   private enqueuePersist(managed: ManagedSession): void {
+    managed.lastPersistEnqueuedAt = Date.now()
     try {
       // Filter out transient status messages (progress indicators like "Compacting...")
       // Error messages are now persisted with rich fields for diagnostics
@@ -3238,6 +3245,7 @@ export class SessionManager implements ISessionManager {
 
     // Lazy-load messages from disk if not yet loaded
     await this.ensureMessagesLoaded(m)
+    m.lastMessagesAccessAt = Date.now()
 
     return managedToSession(m, { messages: m.messages })
   }
@@ -3891,10 +3899,115 @@ export class SessionManager implements ISessionManager {
     this.idleRuntimeReapTimer = setInterval(() => {
       void this.sweepIdleRuntimes().catch((error) => {
         sessionLog.warn(`[idle-reap] sweep failed: ${error instanceof Error ? error.message : error}`)
+      }).then(() => {
+        // After the runtime pass: a session reaped in this sweep keeps its messages until the next one.
+        if (this.idleRuntimeReaperStopped) return
+        try {
+          this.releaseIdleMessages()
+        } catch (error) {
+          sessionLog.warn(`[idle-release] sweep failed: ${error instanceof Error ? error.message : error}`)
+        }
       })
     }, intervalMs)
     this.idleRuntimeReapTimer.unref?.()
     sessionLog.info(`[idle-reap] enabled: reaping session runtimes idle >= ${this.idleRuntimeReapMinutes}m (sweep every ${Math.round(intervalMs / 1000)}s)`)
+    sessionLog.info(this.idleMessageReleaseEnabled
+      ? `[idle-release] enabled: releasing transcripts of sessions idle >= ${this.idleRuntimeReapMinutes}m with no runtime`
+      : `[idle-release] disabled (${IDLE_MESSAGE_RELEASE_ENV}=0)`)
+  }
+
+  /**
+   * Synchronous lazy-load for sync callers that read `managed.messages` (annotations, message
+   * edits, connection changes). A session left cold by startup or by idle release would
+   * otherwise look empty to them. Same hydrate as the cold-persist path.
+   */
+  private ensureMessagesLoadedSync(managed: ManagedSession): void {
+    if (!managed.messagesLoaded) this.hydrateMessagesForColdPersist(managed)
+  }
+
+  /** Gather the release predicate's inputs for one session. `checkDisk=false` skips the disk read. */
+  private buildIdleMessageReleaseCandidate(managed: ManagedSession, checkDisk: boolean): IdleMessageReleaseCandidate {
+    let pendingPermissions = 0
+    for (const meta of this.pendingPermissionRequests.values()) {
+      if (meta.sessionId === managed.id) pendingPermissions++
+    }
+    let queuedInTranscript = 0
+    let persistable = 0
+    for (const m of managed.messages) {
+      if (m.role !== 'status') persistable++
+      if (m.role === 'user' && m.isQueued === true) queuedInTranscript++
+    }
+    let diskInSync = true
+    if (checkDisk) {
+      try {
+        const header = readSessionHeader(getSessionFilePath(managed.workspace.rootPath, managed.id))
+        diskInSync = !!header && header.messageCount === persistable
+      } catch {
+        diskInSync = false
+      }
+    }
+    return {
+      messagesLoaded: managed.messagesLoaded,
+      hasRuntime: !!(managed.agent || managed.poolServer || managed.mcpPool),
+      isProcessing: managed.isProcessing,
+      transitionInFlight: !!managed.stopRequested
+        || !!managed.authRetryInProgress
+        || managed.autoRetryTimer !== undefined
+        || managed.pendingActivationResend !== undefined
+        || this.agentRefreshLocks.has(managed.id)
+        || (managed.sourceUpdatesInFlight ?? 0) > 0,
+      queuedMessages: managed.messageQueue.length,
+      pendingPermissions,
+      pendingAuth: !!(managed.pendingAuthRequestId || managed.pendingAuthRequest),
+      pendingPlan: !!managed.pendingPlanExecution || managed.lastMessageRole === 'plan',
+      loadInFlight: this.messageLoadingPromises.has(managed.id),
+      persistPending: sessionPersistenceQueue.hasPending(managed.id),
+      queuedInTranscript,
+      diskInSync,
+      lastActivityAt: managed.lastRuntimeActivityAt ?? managed.lastMessageAt,
+      lastAccessAt: managed.lastMessagesAccessAt,
+      lastPersistAt: managed.lastPersistEnqueuedAt,
+    }
+  }
+
+  /**
+   * Drop the in-memory transcript of sessions that are idle and have no runtime,
+   * returning them to the startup cold state (`messagesLoaded: false`). Synchronous
+   * end to end, so no message or event can interleave between the check and the drop.
+   * Public for tests; normally run after each reaper sweep. craft-agents#248.
+   */
+  releaseIdleMessages(nowMs: number = Date.now()): { released: string[]; releasedMessages: number; blocked: Partial<Record<IdleMessageReleaseSkipReason, number>> } {
+    const result: { released: string[]; releasedMessages: number; blocked: Partial<Record<IdleMessageReleaseSkipReason, number>> } = { released: [], releasedMessages: 0, blocked: {} }
+    const thresholdMs = this.idleRuntimeReapMinutes * 60_000
+    if (!this.idleMessageReleaseEnabled || !(thresholdMs > 0)) return result
+    for (const managed of this.sessions.values()) {
+      if (!managed.messagesLoaded) continue
+      // Cheap pass first; only sessions that pass everything else pay for the header read.
+      const pre = evaluateIdleMessageRelease(this.buildIdleMessageReleaseCandidate(managed, false), nowMs, thresholdMs)
+      if (!pre.release) {
+        if (pre.reason !== 'not-idle-long-enough' && pre.reason !== 'has-runtime' && pre.idleMs >= thresholdMs) {
+          result.blocked[pre.reason] = (result.blocked[pre.reason] ?? 0) + 1
+        }
+        continue
+      }
+      const decision = evaluateIdleMessageRelease(this.buildIdleMessageReleaseCandidate(managed, true), nowMs, thresholdMs)
+      if (!decision.release) {
+        result.blocked[decision.reason] = (result.blocked[decision.reason] ?? 0) + 1
+        continue
+      }
+      result.releasedMessages += managed.messages.length
+      managed.messages = []
+      managed.messagesLoaded = false
+      result.released.push(managed.id)
+    }
+    const blockedTotal = Object.values(result.blocked).reduce((a, b) => a + (b ?? 0), 0)
+    if (result.released.length > 0 || blockedTotal > 0) {
+      const blocked = Object.entries(result.blocked).map(([k, v]) => `${k}=${v}`).join(',') || 'none'
+      let loaded = 0
+      for (const m of this.sessions.values()) if (m.messagesLoaded) loaded++
+      sessionLog.info(`[idle-release] sweep: released=${result.released.length} (${result.releasedMessages} messages) idle-but-kept=${blockedTotal} (${blocked}) stillLoaded=${loaded}/${this.sessions.size}`)
+    }
+    return result
   }
 
   private stopIdleRuntimeReaper(): void {
@@ -5858,7 +5971,9 @@ export class SessionManager implements ISessionManager {
       throw new Error(`Session ${sessionId} not found`)
     }
 
-    // Only allow changing connection before first message (session hasn't started)
+    // Only allow changing connection before first message (session hasn't started).
+    // A cold session's messages live on disk only: load them before counting.
+    this.ensureMessagesLoadedSync(managed)
     if (managed.messages && managed.messages.length > 0) {
       sessionLog.warn(`setSessionConnection: cannot change connection after session has started (${sessionId})`)
       throw new Error('Cannot change connection after session has started')
@@ -6324,6 +6439,7 @@ export class SessionManager implements ISessionManager {
     const updates: { lastReadMessageId?: string; hasUnread?: boolean } = {}
 
     // Update lastReadMessageId for legacy/manual unread functionality
+    this.ensureMessagesLoadedSync(managed)
     if (managed.messages.length > 0) {
       const lastFinalId = this.getLastFinalAssistantMessageId(managed.messages)
       if (lastFinalId && managed.lastReadMessageId !== lastFinalId) {
@@ -6639,6 +6755,7 @@ export class SessionManager implements ISessionManager {
       return
     }
 
+    this.ensureMessagesLoadedSync(managed)
     const message = managed.messages.find(m => m.id === messageId)
     if (!message) {
       sessionLog.warn(`Cannot update message: message ${messageId} not found in session ${sessionId}`)
@@ -6662,6 +6779,7 @@ export class SessionManager implements ISessionManager {
       return
     }
 
+    this.ensureMessagesLoadedSync(managed)
     const message = managed.messages.find(m => m.id === messageId)
     if (!message) {
       sessionLog.warn(`Cannot add annotation: message ${messageId} not found in session ${sessionId}`)
@@ -6728,6 +6846,7 @@ export class SessionManager implements ISessionManager {
       return
     }
 
+    this.ensureMessagesLoadedSync(managed)
     const message = managed.messages.find(m => m.id === messageId)
     if (!message) {
       sessionLog.warn(`Cannot update annotation: message ${messageId} not found in session ${sessionId}`)
@@ -6802,6 +6921,7 @@ export class SessionManager implements ISessionManager {
       return
     }
 
+    this.ensureMessagesLoadedSync(managed)
     const message = managed.messages.find(m => m.id === messageId)
     if (!message) {
       sessionLog.warn(`Cannot remove annotation: message ${messageId} not found in session ${sessionId}`)
