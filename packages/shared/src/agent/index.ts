@@ -187,6 +187,9 @@ export {
   type PushableInputStream,
 } from './backend/claude/persistent-input.ts';
 
+// Registry of every Claude CLI the SDK spawns (craft-agents#250), for the idle reaper's backstop.
+export { cliProcessRegistry, type CliRegistration } from './backend/claude/cli-process-registry.ts';
+
 // Guarded-mode risk check seam (the host implements the check; see core/guarded-mode.ts)
 export type { GuardedModeCheck, GuardedModeCall, GuardedModeRisk, GuardedModeVerdict } from './core/guarded-mode.ts';
 // Subagent model choice seam (Settings default + optional host picker; see core/subagent-model.ts)

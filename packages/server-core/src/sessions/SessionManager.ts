@@ -90,7 +90,7 @@ import { getValidClaudeOAuthToken } from '@craft-agent/shared/auth'
 import { resolveAuthEnvVars } from '@craft-agent/shared/config'
 import { toolMetadataStore, getLastApiError } from '@craft-agent/shared/interceptor'
 import { isParentTaskTool } from '@craft-agent/shared/utils/toolNames'
-import { redactBrowserPasswordFills } from '@craft-agent/shared/agent'
+import { redactBrowserPasswordFills, cliProcessRegistry } from '@craft-agent/shared/agent'
 import { restoreFiles } from '@craft-agent/shared/utils/bundle-files'
 import { getCredentialManager } from '@craft-agent/shared/credentials'
 import { CraftMcpClient, McpClientPool, McpPoolServer } from '@craft-agent/shared/mcp'
@@ -4018,7 +4018,28 @@ export class SessionManager implements ISessionManager {
       const blocked = Object.entries(result.blocked).map(([k, v]) => `${k}=${v}`).join(',') || 'none'
       sessionLog.info(`[idle-reap] sweep: reaped=${result.reaped.length} idle-but-kept=${blockedTotal} (${blocked})`)
     }
+    if (!this.idleRuntimeReaperStopped) this.sweepOrphanedClis(nowMs)
     return result
+  }
+
+  /**
+   * Backstop for Claude CLIs no runtime can reach any more (craft-agents#250): those of destroyed
+   * agents, persistent CLIs from an agent's older queries, and persistent CLIs of agents no
+   * session references. See CliProcessRegistry.sweep for the age guard. Also logs the registry
+   * gauge so a leak shows up as a number, not as an OOM.
+   */
+  sweepOrphanedClis(nowMs: number = Date.now()): { tracked: number; terminated: number } {
+    const liveOwners = new Set<string>()
+    for (const managed of this.sessions.values()) {
+      const ownerId = (managed.agent as { getCliOwnerId?: () => string } | null | undefined)?.getCliOwnerId?.()
+      if (ownerId) liveOwners.add(ownerId)
+    }
+    const { tracked, terminated } = cliProcessRegistry.sweep(liveOwners)
+    for (const e of terminated) {
+      sessionLog.warn(`[idle-reap] terminating orphaned Claude CLI pid=${e.pid} session=${e.sessionId ?? 'unknown'} kind=${e.kind} generation=${e.generation} age=${Math.round((nowMs - e.registeredAt) / 60_000)}m`)
+    }
+    sessionLog.info(`[idle-reap] cli registry: tracked=${tracked} liveAgents=${liveOwners.size} orphansTerminated=${terminated.length}`)
+    return { tracked, terminated: terminated.length }
   }
 
   /**

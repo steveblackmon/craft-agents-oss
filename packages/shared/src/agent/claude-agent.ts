@@ -37,6 +37,8 @@ import { PendingSteers } from './backend/claude/pending-steers.ts';
 import type { RedirectMetadata, PendingSteer } from './backend/types.ts';
 import { SourceActivationDrainController } from './source-activation-drain.ts';
 import { resolveKeepBackgroundTasksAlive, createPushableInputStream, type PushableInputStream } from './backend/claude/persistent-input.ts';
+import { cliProcessRegistry, type CliKind } from './backend/claude/cli-process-registry.ts';
+import { randomUUID } from 'crypto';
 import { createToolServer, liveMcpServers, mcpServerChanges, mcpServerSignature, waitForIdleMcpServers, waitForMcpServers, type LiveMcpServers, type ToolServer } from './backend/claude/live-mcp-servers.ts';
 import { classifyClaudeTaskNotification, classifyClaudeTaskProgress } from './backend/claude/task-notification.ts';
 import {
@@ -549,6 +551,31 @@ export class ClaudeAgent extends BaseAgent {
   private stoppedTurn: { fallback: ReturnType<typeof setTimeout> } | null = null;
 
   /**
+   * Identity of this agent instance in the CLI process registry (craft-agents#250). Every CLI the
+   * SDK spawns for this agent is registered under it, so teardown and the reaper can end CLIs this
+   * agent no longer references.
+   */
+  private readonly cliOwnerId = randomUUID();
+  /** Bumped each time a new persistent query is created; older persistent CLIs are stale. */
+  private persistentGeneration = 0;
+
+  /** Registry owner id (read by the idle reaper's backstop). */
+  getCliOwnerId(): string {
+    return this.cliOwnerId;
+  }
+
+  /** SDK `onProcessSpawned` hook registering the spawned CLI under this agent. */
+  private cliSpawnHook(kind: CliKind): { onProcessSpawned: (pid: number) => void } {
+    const generation = this.persistentGeneration;
+    const sessionId = this.config.session?.id;
+    return {
+      onProcessSpawned: (pid: number) => {
+        cliProcessRegistry.register(pid, { ownerId: this.cliOwnerId, sessionId, kind, generation });
+      },
+    };
+  }
+
+  /**
    * Tear down the persistent query. Idempotent, and the single funnel for ALL
    * teardown paths (dispose/destroy, auth-fail, recreate-on-change, clearHistory,
    * consumer exit). Guarantees no subprocess leak: ends the input, returns the
@@ -576,6 +603,9 @@ export class ClaudeAgent extends BaseAgent {
     this.stoppedTurn = null;
     // A dead query can't stop tasks: stopBackgroundTask must report "not running", not reject
     this.currentQuery = null;
+    // Backstop for the SDK's close path: any persistent CLI of this agent still running once the
+    // SDK's grace is over is ended (identity-checked; CLIs spawned after this call are untouched).
+    cliProcessRegistry.terminateOwner(this.cliOwnerId, { kind: 'persistent' });
   }
 
   /**
@@ -593,10 +623,18 @@ export class ClaudeAgent extends BaseAgent {
    */
   private async beginPersistentTurn(prompt: SDKUserMessage, options: Options, thinking: Partial<Options>): Promise<AsyncIterable<SDKMessage>> {
     if (!this.persistentInput || !this.currentQuery) {
+      // A previous query's state still set (currentQuery dropped by a Stop/redirect while its
+      // input, iterator and controller stayed): overwriting it below would leave that CLI running
+      // with nothing left to end it (craft-agents#250). Tear it down first.
+      if (this.persistentInput || this.persistentIterator || this.persistentAbortController) {
+        this.teardownPersistentQuery('replaced');
+      }
       // First turn: create the persistent query + consumer.
+      this.persistentGeneration++;
+      cliProcessRegistry.setOwnerGeneration(this.cliOwnerId, this.persistentGeneration);
       this.persistentInput = createPushableInputStream<SDKUserMessage>();
       this.persistentAbortController = this.currentQueryAbortController;
-      this.currentQuery = query({ prompt: this.persistentInput.stream, options });
+      this.currentQuery = query({ prompt: this.persistentInput.stream, options: { ...options, ...this.cliSpawnHook('persistent') } as Options });
       this.persistentThinkingKey = claudeThinkingKey(thinking);
       this.persistentModel = options.model ?? '';
       this.persistentMcpServers = liveMcpServers(options.mcpServers ?? {});
@@ -1815,19 +1853,19 @@ This is a branched conversation. All prior messages in this conversation are par
         // Send slash commands directly to SDK without context wrapping.
         // The SDK processes these as internal commands (e.g., /compact triggers compaction).
         debug(`[chat] Detected SDK slash command: ${trimmedMessage}`);
-        this.currentQuery = query({ prompt: trimmedMessage, options: optionsWithAbort });
+        this.currentQuery = query({ prompt: trimmedMessage, options: { ...optionsWithAbort, ...this.cliSpawnHook('oneshot') } as Options });
         turnMessageSource = this.currentQuery;
       } else if (hasBinaryAttachments) {
         const sdkMessage = this.buildSDKUserMessage(effectiveUserMessage, attachments);
         async function* singleMessage(): AsyncIterable<SDKUserMessage> {
           yield sdkMessage;
         }
-        this.currentQuery = query({ prompt: singleMessage(), options: optionsWithAbort });
+        this.currentQuery = query({ prompt: singleMessage(), options: { ...optionsWithAbort, ...this.cliSpawnHook('oneshot') } as Options });
         turnMessageSource = this.currentQuery;
       } else {
         // Simple string prompt for text-only messages (may include text file contents)
         const prompt = this.buildTextPrompt(effectiveUserMessage, attachments);
-        this.currentQuery = query({ prompt, options: optionsWithAbort });
+        this.currentQuery = query({ prompt, options: { ...optionsWithAbort, ...this.cliSpawnHook('oneshot') } as Options });
         turnMessageSource = this.currentQuery;
       }
 
@@ -3291,6 +3329,9 @@ This is a branched conversation. All prior messages in this conversation are par
     // WS2: tear down the persistent streaming-input query (if any) so no
     // subprocess/background sub-agents leak past the agent's lifetime.
     this.teardownPersistentQuery('destroy');
+    // Anything else this agent spawned (one-shot queries included) can no longer be reached.
+    cliProcessRegistry.terminateOwner(this.cliOwnerId);
+    cliProcessRegistry.retireOwner(this.cliOwnerId);
     this.pendingPermissions.clear();
 
     // Clear pinned system prompt state
@@ -3417,7 +3458,7 @@ This is a branched conversation. All prior messages in this conversation are par
     };
 
     let result = '';
-    for await (const msg of query({ prompt, options })) {
+    for await (const msg of query({ prompt, options: { ...options, ...this.cliSpawnHook('oneshot') } as Options })) {
       if (msg.type === 'assistant') {
         for (const block of msg.message.content) {
           if (block.type === 'text') {
@@ -3554,7 +3595,7 @@ This is a branched conversation. All prior messages in this conversation are par
     };
 
     return consumeLlmQueryMessages(
-      query({ prompt: request.prompt, options }),
+      query({ prompt: request.prompt, options: { ...options, ...this.cliSpawnHook('oneshot') } as Options }),
       (msg) => this.debug(msg),
     );
   }
